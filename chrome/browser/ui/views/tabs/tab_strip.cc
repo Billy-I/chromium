@@ -28,6 +28,10 @@
 #include "base/time/time.h"
 #include "base/types/to_address.h"
 #include "build/build_config.h"
+#include "cef/libcef/features/features.h"
+#if BUILDFLAG(ENABLE_CEF)
+#include "cef/libcef/browser/chrome/browser_delegate.h"
+#endif
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/browser_commands.h"
 #include "chrome/browser/ui/browser_element_identifiers.h"
@@ -422,6 +426,16 @@ class TabStrip::TabDragContextImpl : public TabDragContext,
   }
 
   bool IsTabDetachable(const TabSlotView* view) const override {
+#if BUILDFLAG(ENABLE_CEF)
+    // Tabs hosted in a managed Chrome-style BrowserView stay docked.
+    if (auto* cef_delegate = tab_strip_->GetBrowserWindowInterface()
+                                 ->GetBrowserForMigrationOnly()
+                                 ->cef_delegate()) {
+      if (cef_delegate->IsChromeTabStripEnabled()) {
+        return false;
+      }
+    }
+#endif
     // The tab is not detachable if it is a pinned home tab on a web app.
     return !(web_app::HasPinnedHomeTab(GetTabStripModel()) &&
              GetIndexOf(view) == 0);

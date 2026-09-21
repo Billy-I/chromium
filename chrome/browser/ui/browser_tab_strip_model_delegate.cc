@@ -12,6 +12,10 @@
 #include "base/functional/callback.h"
 #include "base/functional/callback_helpers.h"
 #include "build/build_config.h"
+#include "cef/libcef/features/features.h"
+#if BUILDFLAG(ENABLE_CEF)
+#include "cef/libcef/browser/chrome/browser_delegate.h"
+#endif
 #include "chrome/browser/glic/public/glic_keyed_service.h"
 #include "chrome/browser/glic/public/service/glic_instance_coordinator.h"
 #include "chrome/browser/lifetime/browser_shutdown.h"
@@ -157,6 +161,13 @@ void BrowserTabStripModelDelegate::DuplicateSplit(
 void BrowserTabStripModelDelegate::MoveToExistingWindow(
     const std::vector<int>& indices,
     int browser_index) {
+#if BUILDFLAG(ENABLE_CEF)
+  if (auto* cef_delegate = browser_->cef_delegate()) {
+    if (cef_delegate->IsChromeTabStripEnabled()) {
+      return;
+    }
+  }
+#endif
   std::vector<BrowserWindowInterface*> existing_browsers =
       browser_->GetFeatures().tab_menu_model_delegate()->GetOtherBrowserWindows(
           web_app::AppBrowserController::IsWebApp(browser_));
@@ -172,11 +183,25 @@ void BrowserTabStripModelDelegate::MoveToExistingWindow(
 
 bool BrowserTabStripModelDelegate::CanMoveTabsToWindow(
     const std::vector<int>& indices) {
+#if BUILDFLAG(ENABLE_CEF)
+  if (auto* cef_delegate = browser_->cef_delegate()) {
+    if (cef_delegate->IsChromeTabStripEnabled()) {
+      return false;
+    }
+  }
+#endif
   return CanMoveTabsToNewWindow(browser_, indices);
 }
 
 void BrowserTabStripModelDelegate::MoveTabsToNewWindow(
     const std::vector<int>& indices) {
+#if BUILDFLAG(ENABLE_CEF)
+  if (auto* cef_delegate = browser_->cef_delegate()) {
+    if (cef_delegate->IsChromeTabStripEnabled()) {
+      return;
+    }
+  }
+#endif
   // chrome:: to disambiguate the free function from this method.
   chrome::MoveTabsToNewWindow(browser_, indices);
 }

@@ -26,6 +26,10 @@
 #include "base/time/time.h"
 #include "base/trace_event/trace_event.h"
 #include "build/build_config.h"
+#include "cef/libcef/features/features.h"
+#if BUILDFLAG(ENABLE_CEF)
+#include "cef/libcef/browser/chrome/browser_delegate.h"
+#endif
 #include "chrome/app/chrome_command_ids.h"
 #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
 #include "chrome/browser/bookmarks/bookmark_model_factory.h"
@@ -1526,6 +1530,14 @@ bool CanMoveActiveTabToNewWindow(BrowserWindowInterface* browser) {
 
 // TODO(crbug.com/435178910) Remove this usage of ListSelectionModel.
 void MoveActiveTabToNewWindow(BrowserWindowInterface* browser) {
+#if BUILDFLAG(ENABLE_CEF)
+  if (auto* cef_delegate =
+          browser->GetBrowserForMigrationOnly()->cef_delegate()) {
+    if (cef_delegate->IsChromeTabStripEnabled()) {
+      return;
+    }
+  }
+#endif
   const ui::ListSelectionModel::SelectedIndices selection =
       browser->GetTabStripModel()
           ->selection_model()
@@ -1537,6 +1549,14 @@ void MoveActiveTabToNewWindow(BrowserWindowInterface* browser) {
 
 bool CanMoveTabsToNewWindow(BrowserWindowInterface* browser,
                             const std::vector<int>& tab_indices) {
+#if BUILDFLAG(ENABLE_CEF)
+  if (auto* cef_delegate =
+          browser->GetBrowserForMigrationOnly()->cef_delegate()) {
+    if (cef_delegate->IsChromeTabStripEnabled()) {
+      return false;
+    }
+  }
+#endif
   if (browser->GetType() == BrowserWindowInterface::TYPE_APP) {
     for (int index : tab_indices) {
       if (web_app::IsPinnedHomeTab(browser->GetTabStripModel(), index)) {
@@ -1550,6 +1570,14 @@ bool CanMoveTabsToNewWindow(BrowserWindowInterface* browser,
 
 void MoveGroupToNewWindow(BrowserWindowInterface* browser,
                           tab_groups::TabGroupId group) {
+#if BUILDFLAG(ENABLE_CEF)
+  if (auto* cef_delegate =
+          browser->GetBrowserForMigrationOnly()->cef_delegate()) {
+    if (cef_delegate->IsChromeTabStripEnabled()) {
+      return;
+    }
+  }
+#endif
   Browser* current_browser = browser->GetBrowserForMigrationOnly();
   Browser* new_browser;
   if (current_browser->is_type_app() &&
