@@ -46,6 +46,8 @@ blink_core_sources_dom = [
   "beforeunload_event_listener.h",
   "cdata_section.cc",
   "cdata_section.h",
+  "selected_semantic_read_scope.cc",
+  "selected_semantic_read_scope.h",
   "character_data.cc",
   "character_data.h",
   "child_frame_disconnector.cc",

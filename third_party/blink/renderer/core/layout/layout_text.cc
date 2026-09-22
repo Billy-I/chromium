@@ -88,6 +88,7 @@ struct SameSizeAsLayoutText : public LayoutObject {
   LogicalOffset previous_starting_point;
   InlineItemSpan inline_items;
   wtf_size_t first_fragment_item_index_;
+  unsigned semantic_identity_coordinates[4];
 };
 
 ASSERT_SIZE(LayoutText, SameSizeAsLayoutText);
@@ -1454,6 +1455,15 @@ void LayoutText::SetInlineItems(InlineItemsData* data,
                                 wtf_size_t begin,
                                 wtf_size_t size) {
   NOT_DESTROYED();
+  semantic_text_identity_ = false;
+  semantic_item_begin_ = begin;
+  semantic_item_count_ = size;
+  semantic_text_start_ = semantic_text_end_ = 0;
+  if (!size || begin > data->items.size() ||
+      size > data->items.size() - begin) {
+    ClearInlineItems();
+    return;
+  }
 #if DCHECK_IS_ON()
   for (wtf_size_t i = begin; i < begin + size; i++) {
     DCHECK_EQ(data->items[i]->GetLayoutObject(), this);
@@ -1464,6 +1474,61 @@ void LayoutText::SetInlineItems(InlineItemsData* data,
     return;
   valid_ng_items_ = true;
   items->SetItems(data, begin, size);
+
+  // This bounded comparison runs only during ordinary inline association,
+  // after the final text buffer and own items have been produced. Capture
+  // consumes the resulting numeric provenance and never invokes this method.
+  const auto* source = DynamicTo<Text>(GetNode());
+  if (!source || source->GetLayoutObject() != this || IsTextFragment() ||
+      IsSVGInlineText() || IsSecure() || HasTextTransform() ||
+      HasVariableLengthTransform() || !size || size > 512 ||
+      begin > data->items.size() || size > data->items.size() - begin)
+    return;
+  const unsigned source_length = source->length();
+  if (!source_length || source_length > 4096)
+    return;
+  const unsigned start = data->items[begin]->StartOffset();
+  unsigned end = start;
+  for (wtf_size_t index = begin; index < begin + size; ++index) {
+    const auto& item = *data->items[index];
+    if (item.GetLayoutObject() != this || item.Type() != InlineItem::kText ||
+        item.TextType() != TextItemType::kNormal ||
+        item.IsGeneratedForLineBreak() || item.StartOffset() != end ||
+        item.EndOffset() <= end)
+      return;
+    end = item.EndOffset();
+  }
+  if (end < start || end - start != source_length ||
+      end > data->text_content.length())
+    return;
+  // Check the numeric bound before data() can unpark the source. A denied
+  // observer access returns empty; it cannot publish an identity record.
+  const String& original = source->data();
+  if (original.length() != source_length)
+    return;
+  for (unsigned offset = 0; offset < source_length; ++offset) {
+    // operator[] yields UTF-16 code units for both 8-bit and 16-bit storage.
+    if (original[offset] != data->text_content[start + offset])
+      return;
+  }
+  semantic_text_start_ = start;
+  semantic_text_end_ = end;
+  semantic_text_identity_ = true;  // Publish only after complete correspondence.
+}
+
+// Capture reads scalar provenance only after current association validation.
+LayoutText::SemanticTextIdentity LayoutText::GetSemanticTextIdentity(
+    const InlineItemsData& current_data, unsigned& start, unsigned& end) const {
+  start = end = 0;
+  if (!HasValidInlineItems() || !semantic_item_count_ ||
+      !inline_items_.MatchesAssociation(current_data, semantic_item_begin_,
+                                       semantic_item_count_))
+    return SemanticTextIdentity::kUnavailable;
+  if (!semantic_text_identity_)
+    return SemanticTextIdentity::kUnsupported;
+  start = semantic_text_start_;
+  end = semantic_text_end_;
+  return SemanticTextIdentity::kIdentity;
 }
 
 void LayoutText::ClearInlineItems() {

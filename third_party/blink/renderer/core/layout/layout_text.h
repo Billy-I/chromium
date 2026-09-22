@@ -293,6 +293,11 @@ class CORE_EXPORT LayoutText : public LayoutObject {
 
   void SetInlineItems(InlineItemsData* data, wtf_size_t begin, wtf_size_t size);
   void ClearInlineItems();
+  // Derived during ordinary inline association; never prepares layout or text.
+  enum class SemanticTextIdentity { kUnavailable, kUnsupported, kIdentity };
+  SemanticTextIdentity GetSemanticTextIdentity(const InlineItemsData& current_data,
+                                              unsigned& start,
+                                              unsigned& end) const;
   bool HasValidInlineItems() const {
     NOT_DESTROYED();
     return valid_ng_items_;
@@ -472,6 +477,8 @@ class CORE_EXPORT LayoutText : public LayoutObject {
   mutable unsigned ignore_whitespace_for_accessibility_ : 1 = 0;
   mutable unsigned has_cached_ignore_whitespace_for_accessibility_ : 1 = 0;
 
+  unsigned semantic_text_identity_ : 1 = false;
+
   DOMNodeId node_id_ = kInvalidDOMNodeId;
 
   String text_;
@@ -486,6 +493,14 @@ class CORE_EXPORT LayoutText : public LayoutObject {
   // |FragmentItems::Items()|. Zero means there are no such item.
   // Valid only when IsInLayoutNGInlineFormattingContext().
   wtf_size_t first_fragment_item_index_ = 0u;
+
+  // Coordinates bind the proof to the exact associated range, not merely to
+  // an object whose inline items happen to remain valid.
+  unsigned semantic_item_begin_ = 0;
+  unsigned semantic_item_count_ = 0;
+  unsigned semantic_text_start_ = 0;
+  unsigned semantic_text_end_ = 0;
+
 };
 
 inline wtf_size_t LayoutText::FirstInlineFragmentItemIndex() const {

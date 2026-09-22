@@ -29,6 +29,7 @@
 #include "base/containers/span.h"
 #include "build/build_config.h"
 #include "third_party/blink/renderer/core/dom/qualified_name.h"
+#include "third_party/blink/renderer/core/dom/selected_semantic_read_scope.h"
 #include "third_party/blink/renderer/platform/wtf/allocator/allocator.h"
 
 namespace blink {
@@ -69,7 +70,9 @@ class Attribute {
   // NOTE: The references returned by these functions are only valid for as long
   // as the Attribute stays in place. For example, calling a function that
   // mutates an Element's internal attribute storage may invalidate them.
-  const AtomicString& Value() const { return value_; }
+  const AtomicString& Value() const {
+    return SelectedSemanticReadScope::AllowAttribute(*this) ? value_ : g_null_atom;
+  }
   const AtomicString& Prefix() const { return name_.Prefix(); }
   const AtomicString& LocalName() const { return name_.LocalName(); }
   const AtomicString& NamespaceURI() const { return name_.NamespaceURI(); }

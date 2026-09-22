@@ -35,6 +35,15 @@ struct InlineItemSpan final {
     size_ = 0;
   }
 
+  // Compare identity before touching the old data carrier. These checks also
+  // protect Items() from stale or out-of-bounds association coordinates.
+  bool MatchesAssociation(const InlineItemsData& current_data,
+                          wtf_size_t begin, wtf_size_t size) const {
+    return data_ == &current_data && begin_ == begin && size_ == size &&
+           begin <= current_data.items.size() &&
+           size <= current_data.items.size() - begin;
+  }
+
   bool empty() const { return size_ == 0; }
   wtf_size_t size() const { return size_; }
 

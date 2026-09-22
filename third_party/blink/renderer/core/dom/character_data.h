@@ -26,6 +26,7 @@
 
 #include "third_party/blink/renderer/core/core_export.h"
 #include "third_party/blink/renderer/core/dom/node.h"
+#include "third_party/blink/renderer/core/dom/selected_semantic_read_scope.h"
 #include "third_party/blink/renderer/platform/bindings/parkable_string.h"
 #include "third_party/blink/renderer/platform/wtf/casting.h"
 #include "third_party/blink/renderer/platform/wtf/text/wtf_string.h"
@@ -46,6 +47,9 @@ class CORE_EXPORT CharacterData : public Node {
   // Makes the data Parkable. This enables de-duplication and compression.
   void MakeParkable();
   const String& data() const {
+    if (!SelectedSemanticReadScope::AllowCharacterData(*this)) {
+      return g_empty_string;
+    }
     return is_parkable_ ? parkable_data_.ToString() : data_;
   }
   void setData(const String&);
