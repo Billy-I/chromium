@@ -57,6 +57,35 @@
 #include "third_party/blink/renderer/platform/wtf/functional.h"
 #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
 
+#include <array>
+#include <vector>
+#include "base/check.h"
+#include "base/functional/bind.h"
+#include "ui/accessibility/ax_mode.h"
+#include "ui/gfx/geometry/size.h"
+#include "third_party/blink/renderer/core/dom/document.h"
+#include "third_party/blink/renderer/core/frame/local_frame.h"
+#include "third_party/blink/renderer/core/resize_observer/resize_observer.h"
+#include "third_party/blink/renderer/core/resize_observer/resize_observer_entry.h"
+#include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+#include "third_party/blink/renderer/platform/heap/member.h"
+#include "third_party/blink/renderer/platform/heap/visitor.h"
+#include "third_party/blink/renderer/core/html/html_iframe_element.h"
+#include "third_party/blink/renderer/core/layout/inline/fragment_item.h"
+#include "third_party/blink/renderer/core/layout/inline/fragment_items.h"
+#include "third_party/blink/renderer/core/testing/sim/sim_request.h"
+#include "third_party/blink/renderer/core/testing/sim/sim_test.h"
+#include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
+#include "third_party/blink/renderer/platform/wtf/casting.h"
+#include <atomic>
+#include <vector>
+#include "base/run_loop.h"
+#include "base/check.h"
+#include "base/functional/bind.h"
+#include "base/test/task_environment.h"
+#include "base/time/tick_clock.h"
+#include "third_party/blink/renderer/platform/wtf/wtf.h"
+
 namespace blink {
 
 namespace {
@@ -2097,5 +2126,1091 @@ TEST_F(SelectedSemanticPolicyTest, ProvenanceInvalidAssociationRangesStayUnavail
   SetBodyInnerHTML("<p id=target>Allowed</p>");
   ExpectRealProvenanceBoundary(7u, 1u, false, true);
 }
+
+class SelectedSemanticRequestTestPeer {
+ public:
+  static void Ready(SelectedSemanticRequestV1& request) { request.OnAXReady(); }
+  static void Deadline(SelectedSemanticRequestV1& request) { request.OnDeadline(); }
+  static std::unique_ptr<SelectedSemanticRequestV1> CreateWithClock(
+      Document& document, AXObjectCacheImpl& cache, Node& node, uint64_t epoch,
+      base::TimeTicks deadline,
+      scoped_refptr<base::SingleThreadTaskRunner> runner,
+      SelectedSemanticRequestV1::Completion completion,
+      const base::TickClock& clock) {
+    CHECK(IsMainThread());
+    auto request = std::unique_ptr<SelectedSemanticRequestV1>(
+        new SelectedSemanticRequestV1(document, cache, node, epoch, deadline,
+                                      std::move(runner), std::move(completion),
+                                      &clock));
+    request->Start();
+    return request;
+  }
+};
+
+class SelectedSemanticRequestTest : public RenderingTest {
+ protected:
+  SelectedSemanticRequestTest()
+      : RenderingTest(base::test::TaskEnvironment::TimeSource::MOCK_TIME) {}
+  void SetUp() override {
+    RenderingTest::SetUp();
+    ax_context_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
+  }
+  void TearDown() override {
+    ax_context_.reset();
+    RenderingTest::TearDown();
+  }
+  void SetReadyBody(const String& html = "<p id=target>Allowed</p>") {
+    SetBodyInnerHTML(html);
+    cache_ = To<AXObjectCacheImpl>(GetDocument().ExistingAXObjectCache());
+    ASSERT_NE(nullptr, cache_.Get());
+    cache_->MarkDocumentDirty();
+    cache_->UpdateAXForAllDocuments();
+  }
+  Node* Target() { return GetElementById("target")->firstChild(); }
+  using Results = std::vector<SemanticRequestResultV1>;
+  std::unique_ptr<SelectedSemanticRequestV1> Request(
+      Node& target, std::shared_ptr<Results> results, uint64_t epoch = 7,
+      base::TimeDelta duration = base::Seconds(1)) {
+    return SelectedSemanticRequestV1::Create(
+        GetDocument(), *cache_, target, epoch, base::TimeTicks::Now() + duration,
+        task_environment().GetMainThreadTaskRunner(),
+        blink::BindOnce([](WeakPersistent<AXObjectCacheImpl> cache,
+                           std::shared_ptr<Results> results,
+                           SemanticRequestResultV1 result) {
+          // Client completion must never execute inside frozen capture.
+          EXPECT_FALSE(cache && cache->IsFrozen());
+          results->push_back(std::move(result));
+        }, cache_, std::move(results)));
+  }
+  void DriveAX() {
+    // Ambient test driver, not a request implementation preparation call.
+    cache_->MarkDocumentDirty();
+    cache_->UpdateAXForAllDocuments();
+  }
+  void Deliver() { task_environment().RunUntilIdle(); }
+  void ExpectUnread(const SemanticRequestResultV1& result,
+                    SemanticRequestTerminalV1 terminal) {
+    EXPECT_EQ(terminal, result.terminal);
+    EXPECT_TRUE(result.node.text.empty());
+    EXPECT_EQ(0u, result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.structural_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+  }
+  WeakPersistent<AXObjectCacheImpl> cache_;
+  std::unique_ptr<AXContext> ax_context_;
+};
+
+TEST_F(SelectedSemanticRequestTest, RealReadyCallbackPostsImmutableResultAfterFreeze) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  EXPECT_TRUE(results->empty());
+  DriveAX();
+  EXPECT_TRUE(results->empty());
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(7u, result.epoch);
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted, result.node.disposition);
+  EXPECT_EQ("Allowed", result.node.text);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, OwnZeroAndOffscreenRequestsStayUnread) {
+  const char* styles[] = {
+      "appearance:none;width:0;height:20px;padding:0;border:0;overflow:visible",
+      "position:relative;left:900px;width:40px;height:20px"};
+  for (unsigned index = 0; index < std::size(styles); ++index) {
+    SCOPED_TRACE(index);
+    SetReadyBody(String("<button id=target aria-label=Excluded style='") +
+                 styles[index] + "'></button>");
+    auto results = std::make_shared<Results>();
+    auto request = Request(*GetElementById("target"), results);
+    DriveAX();
+    EXPECT_TRUE(results->empty());
+    Deliver();
+    ASSERT_EQ(1u, results->size());
+    const auto& result = results->front();
+    ExpectUnread(result, SemanticRequestTerminalV1::kPolicyResult);
+    EXPECT_EQ(index == 0 ? SemanticDispositionV1::kOwnZeroSize
+                        : SemanticDispositionV1::kOffscreen,
+              result.node.disposition);
+    EXPECT_EQ(0u, result.budget.utf8_bytes);
+  }
+}
+
+TEST_F(SelectedSemanticRequestTest, CancelBeforeCallbackIsUnreadAndOnce) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  request->Cancel();
+  request->Cancel();
+  EXPECT_TRUE(results->empty());
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kCancelled);
+  DriveAX();
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, EpochMismatchBeforeCallbackIsUnread) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  request->InvalidateEpoch(8);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kStaleContext);
+  EXPECT_EQ(7u, results->front().epoch);
+}
+
+TEST_F(SelectedSemanticRequestTest, EqualEpochDoesNotCancel) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  request->InvalidateEpoch(7);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted, results->front().node.disposition);
+}
+
+TEST_F(SelectedSemanticRequestTest, MissingCallbackExpiresWithoutForcedAX) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  // The RenderingTest ChromeClient records scheduling but does not drive a
+  // frame. Advancing the base timer alone cannot force an AX capture.
+  task_environment().FastForwardBy(base::Milliseconds(999));
+  EXPECT_TRUE(results->empty());
+  task_environment().FastForwardBy(base::Milliseconds(1));
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kDeadlineExceeded);
+  DriveAX();
+  Deliver();
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, DestroyPendingRequestPostsOneCancellation) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  request.reset();
+  EXPECT_TRUE(results->empty());
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kCancelled);
+  DriveAX();
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, DuplicateAndLateHandlersCannotCompleteTwice) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  DriveAX();
+  // Invoke handlers through the test peer, never run a consumed OnceClosure.
+  SelectedSemanticRequestTestPeer::Ready(*request);
+  SelectedSemanticRequestTestPeer::Deadline(*request);
+  request->Cancel();
+  request->InvalidateEpoch(8);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted, results->front().node.disposition);
+  request.reset();
+  Deliver();
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, DeadlineAndEpochAdmissionCannotBeWidened) {
+  SetReadyBody();
+  for (const auto duration : {base::Milliseconds(0), base::Milliseconds(5001)}) {
+    auto results = std::make_shared<Results>();
+    auto request = Request(*Target(), results, 7, duration);
+    Deliver();
+    ASSERT_EQ(1u, results->size());
+    ExpectUnread(results->front(), duration.is_zero()
+        ? SemanticRequestTerminalV1::kDeadlineExceeded
+        : SemanticRequestTerminalV1::kInvalidRequest);
+  }
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results, 0);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kInvalidRequest);
+}
+
+TEST_F(SelectedSemanticRequestTest, FiveSecondDeadlineBoundaryIsAccepted) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results, 7, base::Seconds(5));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted, results->front().node.disposition);
+}
+
+TEST_F(SelectedSemanticRequestTest, DetachedTargetCannotBeReboundById) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  Persistent<Node> old_target(Target());
+  Persistent<AXObject> old_object(cache_->Get(old_target.Get()));
+  ASSERT_NE(nullptr, old_object.Get());
+  auto request = Request(*old_target, results);
+  GetElementById("target")->SetInnerHTMLWithoutTrustedTypes("Replacement");
+  ASSERT_NE(old_target.Get(), Target());
+  ASSERT_FALSE(old_target->isConnected());
+  DriveAX();
+  EXPECT_TRUE(old_object->IsDetached());
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kStaleContext);
+}
+
+TEST_F(SelectedSemanticRequestTest, MissingRealAXObjectFailsWithoutCreation) {
+  SetReadyBody("<script type=application/json id=target>Excluded</script>");
+  ASSERT_EQ(nullptr, cache_->Get(Target()));
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kPolicyResult);
+  EXPECT_EQ(SemanticDispositionV1::kStaleDocument, results->front().node.disposition);
+  EXPECT_EQ(nullptr, cache_->Get(Target()));
+}
+
+TEST_F(SelectedSemanticRequestTest, NonFrozenDirtyHandlerCannotPrepareReadiness) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = Request(*Target(), results);
+  GetElementById("target")->setAttribute(html_names::kStyleAttr, AtomicString("color:red"));
+  const auto state = GetDocument().Lifecycle().GetState();
+  ASSERT_LT(state, DocumentLifecycle::kPrePaintClean);
+  SelectedSemanticRequestTestPeer::Ready(*request);
+  EXPECT_EQ(state, GetDocument().Lifecycle().GetState());
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  ExpectUnread(results->front(), SemanticRequestTerminalV1::kPolicyResult);
+  EXPECT_EQ(SemanticDispositionV1::kNotReady, results->front().node.disposition);
+  DriveAX();
+  Deliver();
+  EXPECT_EQ(1u, results->size());
+}
+
+// A request-local monotonic clock; never alters TaskEnvironment/global clocks.
+// Admission and timer arming see before_. After Arm(), only the first read sees
+// before_; all later reads see deadline_. Both methods are thread-safe, although
+// this test arms and reads it solely on the renderer main thread.
+class SelectedSemanticRequestSteppingClock final : public base::TickClock {
+ public:
+  SelectedSemanticRequestSteppingClock(base::TimeTicks before,
+                                      base::TimeTicks deadline)
+      : before_(before), deadline_(deadline) {
+    CHECK(before_ < deadline_);
+  }
+  base::TimeTicks NowTicks() const override {
+    if (!armed_.load()) return before_;
+    return reads_after_arm_.fetch_add(1) == 0 ? before_ : deadline_;
+  }
+  void Arm() { CHECK(!armed_.exchange(true)); }
+  unsigned ReadsAfterArm() const { return reads_after_arm_.load(); }
+
+ private:
+  const base::TimeTicks before_;
+  const base::TimeTicks deadline_;
+  std::atomic<bool> armed_{false};
+  mutable std::atomic<unsigned> reads_after_arm_{0};
+};
+
+TEST_F(SelectedSemanticRequestTest, PostReadDeadlineDropsTextButPreservesAudit) {
+  ASSERT_NO_FATAL_FAILURE(SetReadyBody());
+  auto results = std::make_shared<Results>();
+  const auto before = base::TimeTicks::Now();
+  const auto deadline = before + base::Seconds(1);
+  struct Probe {
+    // Reverse destruction order keeps the clock alive through request/timer
+    // destruction, including early assertion failure and queued callback drop.
+    std::shared_ptr<SelectedSemanticRequestSteppingClock> clock;
+    std::unique_ptr<SelectedSemanticRequestV1> request;
+    bool ready_ran = false;
+  };
+  auto probe = std::make_shared<Probe>();
+  probe->clock = std::make_shared<SelectedSemanticRequestSteppingClock>(
+      before, deadline);
+
+  // Queue first: this real frozen callback must run before CreateWithClock's
+  // ordinary ready closure. Otherwise the request could succeed before this
+  // test arms the stepping clock. Captured state owns its own safe lifetime.
+  cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+      [](WeakPersistent<AXObjectCacheImpl> cache, std::shared_ptr<Probe> probe,
+         std::shared_ptr<Results> results) {
+        ASSERT_TRUE(cache);
+        ASSERT_TRUE(cache->IsFrozen());
+        ASSERT_TRUE(probe->request);
+        probe->ready_ran = true;
+        probe->clock->Arm();
+        SelectedSemanticRequestTestPeer::Ready(*probe->request);
+        // Exactly the pre-read and post-read request checks used this clock;
+        // a scheduler/global-time read cannot consume its stepping sequence.
+        EXPECT_EQ(2u, probe->clock->ReadsAfterArm());
+        EXPECT_TRUE(results->empty());
+      }, cache_, probe, results));
+
+  probe->request = SelectedSemanticRequestTestPeer::CreateWithClock(
+      GetDocument(), *cache_, *Target(), 7, deadline,
+      task_environment().GetMainThreadTaskRunner(),
+      blink::BindOnce(
+          [](WeakPersistent<AXObjectCacheImpl> cache,
+             std::shared_ptr<Results> results, SemanticRequestResultV1 result) {
+            EXPECT_FALSE(cache && cache->IsFrozen());
+            results->push_back(std::move(result));
+          }, cache_, results),
+      *probe->clock);
+  EXPECT_TRUE(results->empty());
+  ASSERT_NO_FATAL_FAILURE(DriveAX());
+  ASSERT_TRUE(probe->ready_ran);
+  EXPECT_TRUE(results->empty());
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestTerminalV1::kDeadlineExceeded, result.terminal);
+  EXPECT_EQ(7u, result.epoch);
+  EXPECT_TRUE(result.node.text.empty());
+  EXPECT_EQ(SemanticDispositionV1::kNotReady, result.node.disposition);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.structural_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  EXPECT_EQ(7u, result.budget.utf8_bytes);  // The real "Allowed" read occurred.
+
+  // Terminal commit invalidated the ordinary queued ready closure and stopped
+  // the timer. Later handlers/destruction cannot publish another completion.
+  SelectedSemanticRequestTestPeer::Ready(*probe->request);
+  SelectedSemanticRequestTestPeer::Deadline(*probe->request);
+  probe->request.reset();
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+  EXPECT_EQ(2u, probe->clock->ReadsAfterArm());
+}
+
+
+namespace {
+// action.html SHA256 da2b79e69a9f165533125a5f046ca28bc3b1de680f7d35a1d143e9c94a60c473
+constexpr char kRun12Action[] = R"LUNARHTML(<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="icon" href="data:,">
+  <title>Lunar I2-07 feasibility action</title>
+  <style nonce="cpW9Rox9tcvrPqZNoQGvsWZ+">
+    html,body{margin:0;width:100%;height:100%;overflow:hidden}main{box-sizing:border-box;height:100%;padding:4px;font:10px/12px sans-serif}.fixture-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 8px}.fixture-case{display:grid;grid-template-rows:20px 20px;height:40px;align-items:start}.fixture-case>*{box-sizing:border-box;margin:0;min-width:0;max-width:100%}.fixture-case>*:first-child{height:20px;overflow:hidden}.fixture-case>p:last-child{line-height:10px;white-space:normal;overflow:visible}.selector-image{width:16px;height:16px}
+    .display-none { display: none; }
+    iframe { width: 8px; height: 8px; border: 0; }
+  </style>
+</head>
+<body data-complete="lunar-action:complete:run-12">
+  <main>
+    <p>lunar-document:safe:run-12:revision-1</p>
+    <p>lunar-feasibility-visible-canary:run-12</p>
+    <button id="allowed-action" aria-label="Activate controlled fixture action"></button>
+    <p id="action-status">lunar-action:pending:run-12</p>
+
+    <section class="fixture-grid" aria-label="structural exclusion cases">
+      <div class="fixture-case" role="group" aria-label="Structural case display-none" data-case="display-none"><p class="display-none">lunar-feasibility-excluded:display-none:run-12</p><p>lunar-feasibility-anchor:display-none:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case aria-hidden" data-case="aria-hidden"><p aria-hidden="true">lunar-feasibility-excluded:aria-hidden:run-12</p><p>lunar-feasibility-anchor:aria-hidden:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case disabled-control" data-case="disabled-control"><input type="checkbox" disabled aria-label="Disabled structural control" data-canary="lunar-feasibility-excluded:disabled-control:run-12"><p>lunar-feasibility-anchor:disabled-control:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case protected" data-case="protected"><input type="password" aria-label="Protected fixture field" value="lunar-feasibility-excluded:protected:run-12"><p>lunar-feasibility-anchor:protected:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case ordinary-input" data-case="ordinary-input"><input type="text" aria-label="Ordinary fixture field" value="lunar-feasibility-excluded:ordinary-input:run-12"><p>lunar-feasibility-anchor:ordinary-input:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case password-input" data-case="password-input"><input type="password" aria-label="Password fixture field" value="lunar-feasibility-excluded:password-input:run-12"><p>lunar-feasibility-anchor:password-input:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case contenteditable-heading" data-case="contenteditable-heading"><h2 contenteditable="true">lunar-feasibility-excluded:contenteditable-heading:run-12</h2><p>lunar-feasibility-anchor:contenteditable-heading:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case contenteditable-group" data-case="contenteditable-group"><div role="group" contenteditable="true">lunar-feasibility-excluded:contenteditable-group:run-12</div><p>lunar-feasibility-anchor:contenteditable-group:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case nested-frame" data-case="nested-frame"><iframe src="/nested-frame" title="lunar-feasibility-excluded:nested-frame:run-12"></iframe><p>lunar-feasibility-anchor:nested-frame:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case content-named-button" data-case="content-named-button"><button>lunar-feasibility-excluded:content-named-button:run-12</button><p>lunar-feasibility-anchor:content-named-button:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case empty-explicit-label" data-case="empty-explicit-label"><button aria-label="" data-canary="lunar-feasibility-excluded:empty-explicit-label:run-12"></button><p>lunar-feasibility-anchor:empty-explicit-label:run-12</p></div>
+      <div class="fixture-case" role="group" aria-label="Structural case unsupported-selector" data-case="unsupported-selector"><div role="img" aria-label="Unavailable selector image" class="selector-image" data-canary="lunar-feasibility-excluded:unsupported-selector:run-12"></div><p>lunar-feasibility-anchor:unsupported-selector:run-12</p></div>
+    </section>
+  </main>
+  <script nonce="cpW9Rox9tcvrPqZNoQGvsWZ+">document.getElementById("allowed-action").addEventListener("click",()=>{document.getElementById("action-status").firstChild.data=document.body.dataset.complete;});</script>
+</body>
+</html>
+)LUNARHTML";
+
+// action-noop.html SHA256 d9baa3167030204225872971d5623361953a7b99aa4745eccc0a8fcebc0fb483
+[[maybe_unused]] constexpr char kRun12ActionNoop[] = R"LUNARHTML(<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Lunar I2-07 feasibility no-op</title></head>
+<body data-complete="lunar-action:complete:run-12">
+  <main>
+    <p>lunar-document:noop:run-12:revision-1</p>
+    <p>lunar-feasibility-visible-canary:run-12</p>
+    <button id="allowed-action" aria-label="Activate controlled fixture action"></button>
+    <p id="action-status">lunar-action:pending:run-12</p>
+  </main>
+</body>
+</html>
+)LUNARHTML";
+
+// reload-old.html SHA256 2e38b262b3a657aef99d7d358acb28e9480174d41106cf8646181bdba0f173ec
+[[maybe_unused]] constexpr char kRun12ReloadOld[] = R"LUNARHTML(<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Lunar I2-07 feasibility reload old</title></head>
+<body data-complete="lunar-action:complete:run-12">
+  <main>
+    <p>lunar-document:reload-old:run-12:revision-1</p>
+    <p>lunar-feasibility-visible-canary:run-12</p>
+    <button id="allowed-action" aria-label="Activate controlled fixture action"></button>
+    <p id="action-status">lunar-action:pending:run-12</p>
+  </main>
+</body>
+</html>
+)LUNARHTML";
+
+// reload-new.html SHA256 5635f2c6f5a8295fc97446fffd771e3245a0e897c47a0ad1a42d680dfbf9c036
+[[maybe_unused]] constexpr char kRun12ReloadNew[] = R"LUNARHTML(<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Lunar I2-07 feasibility reload new</title></head>
+<body data-complete="lunar-action:complete:run-12">
+  <main>
+    <p>lunar-document:reload-new:run-12:revision-2</p>
+    <p>lunar-feasibility-visible-canary:run-12</p>
+    <button id="allowed-action" aria-label="Activate controlled fixture action"></button>
+    <p id="action-status">lunar-action:pending:run-12</p>
+  </main>
+</body>
+</html>
+)LUNARHTML";
+
+// nested-frame.html SHA256 d1bb91eb3075b1a489baf545270f6fe1d3e7fdbf4dcbad27879d1fe4041f9647
+constexpr char kRun12NestedFrame[] = R"LUNARHTML(<!doctype html><html><body><p>nested-frame-canary</p></body></html>
+)LUNARHTML";
+
+constexpr const char* kRun12Cases[] = {
+    "display-none", "aria-hidden", "disabled-control", "protected",
+    "ordinary-input", "password-input", "contenteditable-heading",
+    "contenteditable-group", "nested-frame", "content-named-button",
+    "empty-explicit-label", "unsupported-selector"};
+
+// Separate minimal-fixture mutation helper, never used by a semantic capture.
+// Blink invokes this through actual ResizeObserver lifecycle delivery only.
+class SemanticTargetDetachingResizeDelegate final
+    : public ResizeObserver::Delegate {
+ public:
+  SemanticTargetDetachingResizeDelegate(Node* target, AXObjectCacheImpl* cache)
+      : target_(target), cache_(cache) {}
+  void OnResize(const HeapVector<Member<ResizeObserverEntry>>& entries) override {
+    ++calls_;
+    EXPECT_FALSE(entries.empty());
+    EXPECT_FALSE(cache_ && cache_->IsFrozen());
+    if (removed_) return;
+    // Hold only for this test mutation. The request itself keeps weak handles.
+    Persistent<Node> target(target_.Get());
+    if (!target || !target->isConnected()) return;
+    target->remove();
+    removed_ = !target->isConnected();
+  }
+  unsigned Calls() const { return calls_; }
+  bool Removed() const { return removed_; }
+  void Trace(Visitor* visitor) const override {
+    ResizeObserver::Delegate::Trace(visitor);
+    visitor->Trace(target_);
+    visitor->Trace(cache_);
+  }
+
+ private:
+  WeakMember<Node> target_;
+  WeakMember<AXObjectCacheImpl> cache_;
+  unsigned calls_ = 0;
+  bool removed_ = false;
+};
+
+class SelectedSemanticRun12FixtureTest : public SimTest {
+ protected:
+  SelectedSemanticRun12FixtureTest()
+      : SimTest(base::test::TaskEnvironment::TimeSource::MOCK_TIME) {}
+
+  void TearDown() override {
+    child_ax_.reset();
+    main_ax_.reset();
+    SimTest::TearDown();
+  }
+
+  // Each width gets a fresh test/page. Navigation lifetime is tested separately.
+  void LoadExactAction(int width) {
+    ResizeView(gfx::Size(width, 600));
+    // SimRequest is an in-process loader registration, not a socket/server.
+    // Both resources must be registered before the parent parses the iframe.
+    SimRequest main_resource("https://lunar-policy.test/action", "text/html");
+    SimRequest child_resource("https://lunar-policy.test/nested-frame", "text/html");
+    LoadURL("https://lunar-policy.test/action");
+    main_resource.Complete(String::FromUtf8(kRun12Action));
+    child_resource.Complete(String::FromUtf8(kRun12NestedFrame));
+
+    auto* iframe = DynamicTo<HTMLIFrameElement>(GetDocument().QuerySelector(
+        AtomicString(".fixture-case[data-case='nested-frame'] > iframe")));
+    ASSERT_NE(nullptr, iframe);
+    ASSERT_NE(nullptr, iframe->contentDocument());
+    ASSERT_NE(&GetDocument(), iframe->contentDocument());
+    EXPECT_EQ("nested-frame-canary", iframe->contentDocument()->body()
+                  ->firstElementChild()->firstChild()->nodeValue());
+    // The above string assertion is SETUP only, outside a service read scope.
+    main_ax_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
+    child_ax_ = std::make_unique<AXContext>(*iframe->contentDocument(),
+                                          ui::kAXModeDefaultForTests);
+    // Bind exact DOM nodes and register requests before the ambient AX driver.
+    // No fixture style normalization or OffsetMapping creation is performed.
+  }
+
+  Element* Case(const char* name) {
+    return GetDocument().QuerySelector(AtomicString(
+        String(".fixture-case[data-case='") + name + "']"));
+  }
+
+  Text* Anchor(const char* name) {
+    Element* group = Case(name);
+    if (!group || !group->lastElementChild()) return nullptr;
+    return DynamicTo<Text>(group->lastElementChild()->firstChild());
+  }
+
+  using Disposition = SemanticDispositionV1;
+  using Terminal = SemanticRequestTerminalV1;
+  struct Slot { std::vector<SemanticRequestResultV1> results; };
+  struct PositiveSource {
+    WeakPersistent<Node> node;
+    String expected;
+  };
+  struct Pending {
+    std::shared_ptr<Slot> slot;
+    std::unique_ptr<SelectedSemanticRequestV1> request;
+  };
+  struct StructuralProbe {
+    bool ran = false;
+    bool had_ax = false;
+    bool cached_hidden = false;
+    bool source_parent_style_missing = false;
+    Disposition disposition = Disposition::kNotReady;
+    SemanticBudgetV1 budget;
+    SemanticAuditV1 audit;
+  };
+  struct NegativeSpec {
+    const char* name;
+    bool use_first_child_text;
+    bool allow_actual_ax_absence;
+    Disposition node_if_present;
+    Disposition structure;
+    unsigned content_reads;
+  };
+  static constexpr std::array<NegativeSpec, 12> kNegativeSpecs = {{
+      {"display-none", true, true, Disposition::kForbiddenAncestor,
+       Disposition::kForbiddenAncestor, 0},
+      {"aria-hidden", true, true, Disposition::kForbiddenAncestor,
+       Disposition::kForbiddenAncestor, 0},
+      {"disabled-control", false, false, Disposition::kUnsupportedText,
+       Disposition::kForbiddenAncestor, 0},
+      {"protected", false, false, Disposition::kUnsupportedText,
+       Disposition::kForbiddenAncestor, 0},
+      {"ordinary-input", false, false, Disposition::kUnsupportedText,
+       Disposition::kForbiddenAncestor, 0},
+      {"password-input", false, false, Disposition::kUnsupportedText,
+       Disposition::kForbiddenAncestor, 0},
+      {"contenteditable-heading", true, true, Disposition::kForbiddenAncestor,
+       Disposition::kForbiddenAncestor, 0},
+      {"contenteditable-group", true, true, Disposition::kForbiddenAncestor,
+       Disposition::kForbiddenAncestor, 0},
+      {"nested-frame", false, false, Disposition::kUnsupportedText,
+       Disposition::kForbiddenAncestor, 0},
+      {"content-named-button", false, false, Disposition::kUnsupportedText,
+       Disposition::kAdmitted, 0},
+      {"empty-explicit-label", false, false, Disposition::kUnsupportedText,
+       Disposition::kAdmitted, 1},
+      {"unsupported-selector", false, false, Disposition::kUnsupportedText,
+       Disposition::kUnsupportedText, 0},
+  }};
+
+  AXObjectCacheImpl& CacheFor(Document& document) {
+    auto* cache = To<AXObjectCacheImpl>(document.ExistingAXObjectCache());
+    CHECK(cache);
+    return *cache;
+  }
+
+  Pending QueueRequest(Node& source, AXObjectCacheImpl& cache) {
+    Pending pending;
+    pending.slot = std::make_shared<Slot>();
+    pending.request = SelectedSemanticRequestV1::Create(
+        source.GetDocument(), cache, source, 12,
+        base::TimeTicks::Now() + base::Seconds(5),
+        task_environment().GetMainThreadTaskRunner(),
+        blink::BindOnce(
+            [](WeakPersistent<AXObjectCacheImpl> weak_cache,
+               std::shared_ptr<Slot> slot, SemanticRequestResultV1 result) {
+              EXPECT_FALSE(weak_cache && weak_cache->IsFrozen());
+              slot->results.push_back(std::move(result));
+            }, WeakPersistent<AXObjectCacheImpl>(&cache), pending.slot));
+    EXPECT_TRUE(pending.slot->results.empty());
+    return pending;
+  }
+
+  std::shared_ptr<StructuralProbe> QueueStructure(Node& source,
+                                                 AXObjectCacheImpl& cache) {
+    auto probe = std::make_shared<StructuralProbe>();
+    cache.ScheduleAXUpdateWithCallback(blink::BindOnce(
+        [](WeakPersistent<AXObjectCacheImpl> cache, WeakPersistent<Node> source,
+           std::shared_ptr<StructuralProbe> probe) {
+          ASSERT_TRUE(cache && source);
+          ASSERT_TRUE(cache->IsFrozen());
+          ScriptForbiddenScope forbid_script;
+          const AXObject* object = cache->Get(source.Get());
+          probe->had_ax = object != nullptr;
+          if (const auto* parent = DynamicTo<Element>(source->parentNode()))
+            probe->source_parent_style_missing = !parent->GetComputedStyle();
+          if (object) {
+            ASSERT_FALSE(object->NeedsToUpdateCachedValues());
+            probe->cached_hidden = object->IsHiddenViaStyle();
+          }
+          probe->disposition = ClassifySelectedStructureV1(
+              *source, *cache, probe->budget, probe->audit);
+          probe->ran = true;
+        }, WeakPersistent<AXObjectCacheImpl>(&cache),
+        WeakPersistent<Node>(&source), probe));
+    return probe;
+  }
+
+  // Explicit ambient driver only. The request itself merely schedules; neither
+  // request capture nor structural probe forces AX/layout/provenance creation.
+  // These compatibility tests exercise the genuine frozen ready-callback hook,
+  // not proof of ordinary unforced renderer scheduling or compositor coherence.
+  void DriveAX(AXObjectCacheImpl& cache) {
+    cache.MarkDocumentDirty();
+    cache.UpdateAXForAllDocuments();
+  }
+
+  void BindMainPositives(const String& document_marker,
+                         std::vector<PositiveSource>& sources) {
+    Element* main = GetDocument().QuerySelector(AtomicString("main"));
+    ASSERT_NE(nullptr, main);
+    Element* document_p = main->firstElementChild();
+    ASSERT_NE(nullptr, document_p);
+    Element* canary_p = document_p->nextElementSibling();
+    ASSERT_NE(nullptr, canary_p);
+    auto* document_text = DynamicTo<Text>(document_p->firstChild());
+    auto* canary_text = DynamicTo<Text>(canary_p->firstChild());
+    Element* button = GetDocument().getElementById(AtomicString("allowed-action"));
+    Element* status = GetDocument().getElementById(AtomicString("action-status"));
+    ASSERT_TRUE(document_text && canary_text && button && status);
+    auto* status_text = DynamicTo<Text>(status->firstChild());
+    ASSERT_NE(nullptr, status_text);
+    // The exact UA button is empty: do not substitute visible button content.
+    ASSERT_EQ(nullptr, button->firstChild());
+    sources.push_back({WeakPersistent<Node>(document_text), document_marker});
+    sources.push_back({WeakPersistent<Node>(canary_text),
+                      "lunar-feasibility-visible-canary:run-12"});
+    sources.push_back({WeakPersistent<Node>(button),
+                      "Activate controlled fixture action"});
+    sources.push_back({WeakPersistent<Node>(status_text),
+                      "lunar-action:pending:run-12"});
+  }
+
+  void ExpectPositive(const Pending& pending, const String& expected) {
+    ASSERT_EQ(1u, pending.slot->results.size());
+    const auto& result = pending.slot->results.front();
+    EXPECT_EQ(Terminal::kPolicyResult, result.terminal);
+    EXPECT_EQ(12u, result.epoch);
+    EXPECT_EQ(Disposition::kAdmitted, result.node.disposition);
+    EXPECT_EQ(expected, result.node.text);
+    EXPECT_EQ(1u, result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+    EXPECT_LE(result.audit.structural_reads, 4096u);
+    EXPECT_LE(result.budget.nodes, 256u);
+    EXPECT_LE(result.budget.fragments, 512u);
+    EXPECT_LE(result.budget.relation_steps, 4096u);
+    EXPECT_LE(result.budget.utf8_bytes, 65536u);
+  }
+
+  void ExpectNegative(const Pending& pending, Disposition disposition,
+                      unsigned permitted_content_reads = 0) {
+    ASSERT_EQ(1u, pending.slot->results.size());
+    const auto& result = pending.slot->results.front();
+    EXPECT_EQ(Terminal::kPolicyResult, result.terminal);
+    EXPECT_EQ(12u, result.epoch);
+    EXPECT_EQ(disposition, result.node.disposition);
+    EXPECT_TRUE(result.node.text.empty());
+    EXPECT_EQ(permitted_content_reads, result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+  }
+
+  void CheckExactAction() {
+    auto& cache = CacheFor(GetDocument());
+    std::vector<PositiveSource> sources;
+    ASSERT_NO_FATAL_FAILURE(BindMainPositives(
+        "lunar-document:safe:run-12:revision-1", sources));
+    for (const char* name : kRun12Cases) {
+      auto* anchor = Anchor(name);
+      ASSERT_NE(nullptr, anchor);
+      sources.push_back({WeakPersistent<Node>(anchor),
+          String("lunar-feasibility-anchor:") + name + ":run-12"});
+    }
+    ASSERT_EQ(16u, sources.size());
+    std::vector<Pending> positives;
+    for (const auto& source : sources)
+      positives.push_back(QueueRequest(*source.node, cache));
+
+    std::vector<Pending> negatives;
+    std::vector<std::shared_ptr<StructuralProbe>> probes;
+    for (const auto& spec : kNegativeSpecs) {
+      SCOPED_TRACE(spec.name);
+      Element* group = Case(spec.name);
+      ASSERT_NE(nullptr, group);
+      Element* first = group->firstElementChild();
+      ASSERT_NE(nullptr, first);
+      Node* source = spec.use_first_child_text
+          ? static_cast<Node*>(DynamicTo<Text>(first->firstChild())) : first;
+      ASSERT_NE(nullptr, source);
+      // This separate actual-ready probe distinguishes an existing rejected AX
+      // source from true AX absence without inventing objects or hidden flags.
+      probes.push_back(QueueStructure(*source, cache));
+      negatives.push_back(QueueRequest(*source, cache));
+    }
+    ASSERT_EQ(12u, negatives.size());
+
+    // Additional content-named child check: the element's missing direct label
+    // is distinct from exclusion of its actual Text descendant.
+    auto* named_button_text = DynamicTo<Text>(
+        Case("content-named-button")->firstElementChild()->firstChild());
+    ASSERT_NE(nullptr, named_button_text);
+    auto named_text_probe = QueueStructure(*named_button_text, cache);
+    auto named_text = QueueRequest(*named_button_text, cache);
+
+    DriveAX(cache);
+    for (const auto& pending : positives) EXPECT_TRUE(pending.slot->results.empty());
+    for (const auto& pending : negatives) EXPECT_TRUE(pending.slot->results.empty());
+    EXPECT_TRUE(named_text.slot->results.empty());
+    task_environment().RunUntilIdle();
+    for (size_t i = 0; i < positives.size(); ++i) {
+      SCOPED_TRACE(sources[i].expected.Utf8());  // Expected test literal only.
+      ASSERT_NO_FATAL_FAILURE(ExpectPositive(positives[i], sources[i].expected));
+    }
+    for (size_t i = 0; i < negatives.size(); ++i) {
+      const auto& spec = kNegativeSpecs[i];
+      const auto& probe = *probes[i];
+      SCOPED_TRACE(spec.name);
+      ASSERT_TRUE(probe.ran);
+      if (String(spec.name) == "display-none" && !probe.had_ax &&
+          probe.disposition == Disposition::kNotReady) {
+        // A truly absent hidden source can lack even cached parent style.
+        // Record this missing-state fence, not an invented hidden-AX rejection.
+        EXPECT_TRUE(probe.source_parent_style_missing);
+      } else {
+        EXPECT_EQ(spec.structure, probe.disposition);
+      }
+      EXPECT_EQ(0u, probe.audit.text_reads);
+      EXPECT_EQ(0u, probe.audit.forbidden_reads);
+      if (!spec.allow_actual_ax_absence) ASSERT_TRUE(probe.had_ax);
+      if (String(spec.name) == "display-none" && probe.had_ax)
+        EXPECT_TRUE(probe.cached_hidden);
+      // Real AX absence is NOT evidence that the node reader classified hidden
+      // AX. Its request outcome is exactly StaleDocument, and the separate
+      // structural result above remains independently required.
+      ASSERT_NO_FATAL_FAILURE(ExpectNegative(
+          negatives[i], probe.had_ax ? spec.node_if_present
+                                    : Disposition::kStaleDocument,
+          probe.had_ax ? spec.content_reads : 0));
+    }
+    ASSERT_TRUE(named_text_probe->ran);
+    EXPECT_EQ(Disposition::kForbiddenAncestor, named_text_probe->disposition);
+    EXPECT_EQ(0u, named_text_probe->audit.text_reads);
+    EXPECT_EQ(0u, named_text_probe->audit.forbidden_reads);
+    ASSERT_NO_FATAL_FAILURE(ExpectNegative(named_text,
+        named_text_probe->had_ax ? Disposition::kForbiddenAncestor
+                                : Disposition::kStaleDocument));
+
+    // Child Text is bound to the REAL child Document/cache, never treated as
+    // main-document content or looked up through the main cache.
+    auto* iframe = DynamicTo<HTMLIFrameElement>(
+        Case("nested-frame")->firstElementChild());
+    ASSERT_TRUE(iframe && iframe->contentDocument());
+    Document& child_document = *iframe->contentDocument();
+    auto* child_text = DynamicTo<Text>(
+        child_document.body()->firstElementChild()->firstChild());
+    ASSERT_NE(nullptr, child_text);
+    auto& child_cache = CacheFor(child_document);
+    auto child_probe = QueueStructure(*child_text, child_cache);
+    auto child_read = QueueRequest(*child_text, child_cache);
+    DriveAX(child_cache);
+    EXPECT_TRUE(child_read.slot->results.empty());
+    task_environment().RunUntilIdle();
+    ASSERT_TRUE(child_probe->ran);
+    EXPECT_EQ(Disposition::kForbiddenAncestor, child_probe->disposition);
+    EXPECT_EQ(0u, child_probe->audit.text_reads);
+    EXPECT_EQ(0u, child_probe->audit.forbidden_reads);
+    ASSERT_NO_FATAL_FAILURE(ExpectNegative(child_read,
+        child_probe->had_ax ? Disposition::kForbiddenAncestor
+                           : Disposition::kStaleDocument));
+    // Further task execution must not add a completion to any captured slot.
+    task_environment().FastForwardBy(base::Seconds(6));
+    for (const auto& pending : positives) EXPECT_EQ(1u, pending.slot->results.size());
+    for (const auto& pending : negatives) EXPECT_EQ(1u, pending.slot->results.size());
+    EXPECT_EQ(1u, named_text.slot->results.size());
+    EXPECT_EQ(1u, child_read.slot->results.size());
+  }
+
+  void LoadExactSimple(const char* url, const char* literal) {
+    ResizeView(gfx::Size(800, 600));
+    SimRequest resource(url, "text/html");
+    LoadURL(url);
+    resource.Complete(String::FromUtf8(literal));
+    main_ax_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
+  }
+
+  void CheckExactSimple(const String& document_marker) {
+    std::vector<PositiveSource> sources;
+    ASSERT_NO_FATAL_FAILURE(BindMainPositives(document_marker, sources));
+    ASSERT_EQ(4u, sources.size());
+    auto& cache = CacheFor(GetDocument());
+    std::vector<Pending> pending;
+    for (const auto& source : sources)
+      pending.push_back(QueueRequest(*source.node, cache));
+    DriveAX(cache);
+    for (const auto& item : pending) EXPECT_TRUE(item.slot->results.empty());
+    task_environment().RunUntilIdle();
+    for (size_t i = 0; i < pending.size(); ++i)
+      ASSERT_NO_FATAL_FAILURE(ExpectPositive(pending[i], sources[i].expected));
+  }
+
+  // Called only after ordinary lifecycle/real readiness. Uses actual fragment
+  // coordinates, not text strings, forced layout, OffsetMapping, or fake lines.
+  void ExpectActualWrappedAnchor() {
+    bool any_distinct_line_top = false;
+    for (const char* name : kRun12Cases) {
+      Text* node = Anchor(name);
+      ASSERT_NE(nullptr, node);
+      const auto* text = DynamicTo<LayoutText>(node->GetLayoutObject());
+      ASSERT_NE(nullptr, text);
+      // Exact fixture has Text directly under its p grid child.
+      const auto* box = DynamicTo<LayoutBlockFlow>(text->Parent());
+      ASSERT_NE(nullptr, box);
+      ASSERT_EQ(1u, box->PhysicalFragmentCount());
+      const auto* fragment = box->GetPhysicalFragment(0);
+      ASSERT_NE(nullptr, fragment);
+      const auto* items = fragment->Items();
+      ASSERT_NE(nullptr, items);
+      ASSERT_EQ(0u, items->SizeOfEarlierFragments());
+      const auto span = items->Items();
+      const auto first = text->FirstInlineFragmentItemIndex();
+      ASSERT_GT(first, 0u);
+      ASSERT_LE(first, span.size());
+      size_t index = first - 1;
+      std::optional<LayoutUnit> first_top;
+      unsigned count = 0;
+      for (;;) {
+        ASSERT_LT(count++, 512u);
+        const auto& item = span[index];
+        ASSERT_EQ(text, item.GetLayoutObject());
+        ASSERT_EQ(FragmentItem::kText, item.Type());
+        const auto& rect = item.RectInContainerFragment();
+        ASSERT_FALSE(rect.IsEmpty());
+        if (!first_top) first_top = rect.Y();
+        else any_distinct_line_top |= rect.Y() != *first_top;
+        const auto delta = item.DeltaToNextForSameLayoutObject();
+        if (!delta) break;
+        ASSERT_LT(delta, span.size() - index);
+        index += delta;
+      }
+    }
+    EXPECT_TRUE(any_distinct_line_top)
+        << "360px fixture must actually wrap; do not change its CSS/font to pass";
+  }
+
+  std::unique_ptr<AXContext> main_ax_;
+  std::unique_ptr<AXContext> child_ax_;
+};
+
+TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12DesktopCapturesAllCases) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactAction(800));
+  ASSERT_NO_FATAL_FAILURE(CheckExactAction());
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12NarrowCapturesAllCasesAndWraps) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactAction(360));
+  ASSERT_NO_FATAL_FAILURE(CheckExactAction());
+  ASSERT_NO_FATAL_FAILURE(ExpectActualWrappedAnchor());
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12NoopDocumentCompatibility) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/action-noop", kRun12ActionNoop));
+  ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:noop:run-12:revision-1"));
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12ReloadOldDocumentCompatibility) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/reload-old", kRun12ReloadOld));
+  ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:reload-old:run-12:revision-1"));
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12ReloadNewDocumentCompatibility) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/reload-new", kRun12ReloadNew));
+  ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:reload-new:run-12:revision-2"));
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest,
+       LateHandlerAfterRealDocumentReplacementCannotRebind) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/reload-old", kRun12ReloadOld));
+  auto& old_cache = CacheFor(GetDocument());
+  const auto old_token = GetDocument().Token();
+  WeakPersistent<Document> old_document(&GetDocument());
+  auto* old_target = DynamicTo<Text>(GetDocument()
+      .getElementById(AtomicString("action-status"))->firstChild());
+  ASSERT_NE(nullptr, old_target);
+  auto pending = QueueRequest(*old_target, old_cache);
+
+  // Real simulated navigation and document replacement, not a manufactured
+  // token/frame pointer. Do not drive the old AX callback before navigation.
+  SimRequest replacement("https://lunar-policy.test/reload-new", "text/html");
+  LoadURL("https://lunar-policy.test/reload-new");
+  replacement.Complete(String::FromUtf8(kRun12ReloadNew));
+  ASSERT_NE(old_document.Get(), &GetDocument());
+  EXPECT_NE(old_token, GetDocument().Token());
+  if (old_document) EXPECT_FALSE(old_document->IsActive());
+  ASSERT_NE(nullptr, GetDocument().getElementById(AtomicString("action-status")));
+  EXPECT_TRUE(pending.slot->results.empty());
+
+  // The old cache can discard queued closures when disposed. Exercise the
+  // delayed-handler fence explicitly after REAL replacement; this is not a
+  // claim that Chromium naturally invokes a disposed cache's callback.
+  SelectedSemanticRequestTestPeer::Ready(*pending.request);
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, pending.slot->results.size());
+  const auto& stale = pending.slot->results.front();
+  EXPECT_EQ(Terminal::kStaleContext, stale.terminal);
+  EXPECT_TRUE(stale.node.text.empty());
+  EXPECT_EQ(0u, stale.audit.text_reads);
+  EXPECT_EQ(0u, stale.audit.structural_reads);
+  EXPECT_EQ(0u, stale.audit.forbidden_reads);
+
+  // A separately admitted new request can read the exact replacement document.
+  // It never substitutes for the old request, whose one result stays stale.
+  main_ax_.reset();
+  main_ax_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
+  ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:reload-new:run-12:revision-2"));
+  pending.request.reset();
+  task_environment().FastForwardBy(base::Seconds(6));
+  EXPECT_EQ(1u, pending.slot->results.size());
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest,
+       RealResizeObserverDetachesPendingTargetBeforeNaturalAXReady) {
+  // Deliberately separate from the immutable Run12 compatibility literals.
+  // Loading/setup creates the real AX context but does not force an AX update.
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/resize-detach", R"HTML(<!doctype html>
+<html><body><div id="resize-trigger" style="width:100px;height:20px"></div>
+<p id="target">Allowed before removal</p></body></html>)HTML"));
+  auto* target_element = GetDocument().getElementById(AtomicString("target"));
+  auto* trigger = GetDocument().getElementById(AtomicString("resize-trigger"));
+  ASSERT_TRUE(target_element && trigger);
+  Persistent<Text> old_target(DynamicTo<Text>(target_element->firstChild()));
+  ASSERT_TRUE(old_target);
+  ASSERT_TRUE(old_target->isConnected());
+  auto& cache = CacheFor(GetDocument());
+  Persistent<SemanticTargetDetachingResizeDelegate> delegate(
+      MakeGarbageCollected<SemanticTargetDetachingResizeDelegate>(
+          old_target.Get(), &cache));
+  Persistent<ResizeObserver> observer(ResizeObserver::Create(&Window(), delegate.Get()));
+  observer->observe(trigger);
+  auto pending = QueueRequest(*old_target, cache);
+  EXPECT_EQ(0u, delegate->Calls());
+
+  // Real style mutation requests a normal lifecycle frame. The observer removes
+  // the exact source Text during that frame; it never calls policy or AX update.
+  trigger->setAttribute(html_names::kStyleAttr,
+                        AtomicString("width:200px;height:20px"));
+  ASSERT_FALSE(Compositor().DeferMainFrameUpdate());
+  ASSERT_TRUE(Compositor().NeedsBeginFrame());
+  // Advance mock time without running any tasks. This puts the ordinary 16ms
+  // BeginFrame timestamp in the past, avoiding SimCompositor's real sleep.
+  task_environment().AdvanceClock(base::Milliseconds(17));
+  Compositor().BeginFrame();
+  ASSERT_GT(delegate->Calls(), 0u);
+  ASSERT_TRUE(delegate->Removed());
+  EXPECT_FALSE(old_target->isConnected());
+  EXPECT_EQ(nullptr, target_element->firstChild());
+  EXPECT_TRUE(pending.slot->results.empty());
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, pending.slot->results.size());
+  const auto& result = pending.slot->results.front();
+  EXPECT_EQ(Terminal::kStaleContext, result.terminal);
+  EXPECT_EQ(12u, result.epoch);
+  EXPECT_TRUE(result.node.text.empty());
+  EXPECT_EQ(0u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.structural_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  observer->disconnect();
+  pending.request.reset();
+  task_environment().FastForwardBy(base::Seconds(6));
+  EXPECT_EQ(1u, pending.slot->results.size());
+  // No DriveAX, UpdateAXForAllDocuments or test-peer Ready call occurs here.
+  // If natural delivery is unavailable, fail this test; do not force success.
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest,
+       LateHandlerAfterRealIFrameDetachCannotReadOldDocument) {
+  // Another minimal test-owned document: no Run12 literal or mandatory layout
+  // is changed to arrange the detachment.
+  ResizeView(gfx::Size(800, 600));
+  SimRequest main_resource("https://lunar-policy.test/detach-parent", "text/html");
+  SimRequest child_resource("https://lunar-policy.test/detach-child", "text/html");
+  LoadURL("https://lunar-policy.test/detach-parent");
+  main_resource.Complete(R"HTML(<!doctype html><html><body>
+<iframe id="frame" src="/detach-child" style="width:200px;height:100px"></iframe>
+</body></html>)HTML");
+  child_resource.Complete(R"HTML(<!doctype html><html><body>
+<p id="target">Child text must stay unread</p></body></html>)HTML");
+  Persistent<HTMLIFrameElement> iframe(DynamicTo<HTMLIFrameElement>(
+      GetDocument().getElementById(AtomicString("frame"))));
+  ASSERT_TRUE(iframe && iframe->contentDocument());
+  Persistent<Document> child_document(iframe->contentDocument());
+  Persistent<LocalFrame> child_frame(child_document->GetFrame());
+  ASSERT_TRUE(child_frame && child_frame->IsAttached());
+  auto* child_target = child_document->getElementById(AtomicString("target"));
+  ASSERT_NE(nullptr, child_target);
+  Persistent<Text> child_text(DynamicTo<Text>(child_target->firstChild()));
+  ASSERT_TRUE(child_text);
+  main_ax_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
+  child_ax_ = std::make_unique<AXContext>(*child_document, ui::kAXModeDefaultForTests);
+  auto pending = QueueRequest(*child_text, CacheFor(*child_document));
+
+  // Real DOM removal calls HTMLFrameOwnerElement::DisconnectContentFrame ->
+  // Frame::Detach(kRemove). Keeping old objects alive tests stale ownership,
+  // not GC absence and not a fabricated IsAttached/frame state.
+  iframe->remove();
+  ASSERT_FALSE(child_frame->IsAttached());
+  EXPECT_TRUE(child_frame->IsDetached());
+  EXPECT_FALSE(child_document->IsActive());
+  EXPECT_EQ(nullptr, iframe->ContentFrame());
+  EXPECT_TRUE(pending.slot->results.empty());
+  // As with navigation, disposal may discard the original queued closure.
+  // Explicit late-handler delivery tests its fence after real frame teardown;
+  // it does not claim the disposed cache naturally emits an AX-ready callback.
+  SelectedSemanticRequestTestPeer::Ready(*pending.request);
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, pending.slot->results.size());
+  const auto& result = pending.slot->results.front();
+  EXPECT_EQ(Terminal::kStaleContext, result.terminal);
+  EXPECT_TRUE(result.node.text.empty());
+  EXPECT_EQ(0u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.structural_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  pending.request.reset();
+  task_environment().FastForwardBy(base::Seconds(6));
+  EXPECT_EQ(1u, pending.slot->results.size());
+}
+
+}  // namespace
 
 }  // namespace blink

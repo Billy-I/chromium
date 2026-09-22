@@ -43,6 +43,13 @@
 #include "third_party/blink/renderer/core/html_names.h"
 #include "third_party/blink/renderer/modules/accessibility/ax_node_object.h"
 
+#include "base/check.h"
+#include "base/functional/bind.h"
+#include "base/location.h"
+#include "base/time/default_tick_clock.h"
+#include "base/time/tick_clock.h"
+#include "third_party/blink/renderer/platform/wtf/wtf.h"
+
 namespace blink {
 // The only class allowed to arm primitive read permits. Every arming operation
 // is immediately followed by its exact getter; no borrowed attribute strings
@@ -724,6 +731,162 @@ SemanticNodeResultV1 ReadSelectedSemanticNodeV1(AXObject& object,
   SemanticNodeResultV1 result = read();
   AccountScope(scope, before, audit);
   return scope.IsClean() ? result : SemanticNodeResultV1{};
+}
+
+std::unique_ptr<SelectedSemanticRequestV1> SelectedSemanticRequestV1::Create(
+    Document& document, AXObjectCacheImpl& cache, Node& node, uint64_t epoch,
+    base::TimeTicks deadline,
+    scoped_refptr<base::SingleThreadTaskRunner> task_runner, Completion completion) {
+  CHECK(IsMainThread());
+  auto request = std::unique_ptr<SelectedSemanticRequestV1>(
+      new SelectedSemanticRequestV1(document, cache, node, epoch, deadline,
+                                    std::move(task_runner), std::move(completion),
+                                    base::DefaultTickClock::GetInstance()));
+  request->Start();
+  return request;
+}
+
+SelectedSemanticRequestV1::SelectedSemanticRequestV1(
+    Document& document, AXObjectCacheImpl& cache, Node& node, uint64_t epoch,
+    base::TimeTicks deadline,
+    scoped_refptr<base::SingleThreadTaskRunner> task_runner, Completion completion,
+    const base::TickClock* clock)
+    : document_(&document), frame_(document.GetFrame()), node_(&node),
+      cache_(&cache), clock_(clock), epoch_(epoch), deadline_(deadline),
+      task_runner_(std::move(task_runner)), completion_(std::move(completion)),
+      timer_(clock_) {
+  CHECK(task_runner_ && task_runner_->RunsTasksInCurrentSequence());
+  CHECK(completion_ && clock_);
+  timer_.SetTaskRunner(task_runner_);
+}
+
+SelectedSemanticRequestV1::~SelectedSemanticRequestV1() {
+  CHECK(IsMainThread() && task_runner_->RunsTasksInCurrentSequence());
+  // Commit a pointer-free cancellation before invalidating member storage.
+  if (!terminal_) Cancel();
+}
+
+void SelectedSemanticRequestV1::Start() {
+  const auto now = clock_->NowTicks();
+  SemanticRequestResultV1 result;
+  if (!epoch_ || deadline_.is_null() || deadline_ > now + base::Seconds(5)) {
+    Finish(std::move(result));
+    return;
+  }
+  if (now >= deadline_) {
+    result.terminal = SemanticRequestTerminalV1::kDeadlineExceeded;
+    Finish(std::move(result));
+    return;
+  }
+  if (!document_ || !frame_ || !node_ || !cache_ ||
+      !document_->IsActive() || !frame_->IsAttached() ||
+      frame_->GetDocument() != document_.Get() ||
+      document_->GetFrame() != frame_.Get() ||
+      &node_->GetDocument() != document_.Get() || !node_->isConnected() ||
+      &cache_->GetDocument() != document_.Get() ||
+      document_->ExistingAXObjectCache() != cache_.Get()) {
+    result.terminal = SemanticRequestTerminalV1::kStaleContext;
+    Finish(std::move(result));
+    return;
+  }
+  // Token initialization is admission work outside the measured ready callback.
+  document_token_ = document_->Token();
+  frame_token_ = frame_->GetLocalFrameToken();
+  const auto arm_now = clock_->NowTicks();
+  if (arm_now >= deadline_) {
+    result.terminal = SemanticRequestTerminalV1::kDeadlineExceeded;
+    Finish(std::move(result));
+    return;
+  }
+  timer_.Start(FROM_HERE, deadline_ - arm_now,
+               base::BindOnce(&SelectedSemanticRequestV1::OnDeadline,
+                              weak_factory_.GetWeakPtr()));
+  cache_->ScheduleAXUpdateWithCallback(
+      base::BindOnce(&SelectedSemanticRequestV1::OnAXReady,
+                     weak_factory_.GetWeakPtr()));
+}
+
+bool SelectedSemanticRequestV1::HasCurrentOwnership() const {
+  return document_ && frame_ && node_ && cache_ && document_token_ && frame_token_ &&
+         document_->IsActive() && frame_->IsAttached() &&
+         document_->GetFrame() == frame_.Get() &&
+         frame_->GetDocument() == document_.Get() &&
+         document_->Token() == *document_token_ &&
+         frame_->GetLocalFrameToken() == *frame_token_ &&
+         &node_->GetDocument() == document_.Get() && node_->isConnected() &&
+         &cache_->GetDocument() == document_.Get() &&
+         document_->ExistingAXObjectCache() == cache_.Get();
+}
+
+void SelectedSemanticRequestV1::OnAXReady() {
+  CHECK(task_runner_->RunsTasksInCurrentSequence());
+  if (terminal_) return;
+  SemanticRequestResultV1 result;
+  if (clock_->NowTicks() >= deadline_) {
+    result.terminal = SemanticRequestTerminalV1::kDeadlineExceeded;
+    Finish(std::move(result));
+    return;
+  }
+  if (!HasCurrentOwnership()) {
+    result.terminal = SemanticRequestTerminalV1::kStaleContext;
+    Finish(std::move(result));
+    return;
+  }
+  result.terminal = SemanticRequestTerminalV1::kPolicyResult;
+  // A manually invoked/non-frozen callback is not a policy capture. Return the
+  // default NotReady node without asking AX to create or update anything.
+  if (cache_->IsFrozen()) {
+    ScriptForbiddenScope forbid_script;
+    if (AXObject* object = cache_->Get(node_.Get()))
+      result.node = ReadSelectedSemanticNodeV1(*object, result.budget, result.audit);
+    else
+      result.node.disposition = SemanticDispositionV1::kStaleDocument;
+  }
+  // Preserve honest read counts if a valid synchronous capture crosses expiry.
+  if (clock_->NowTicks() >= deadline_)
+    result.terminal = SemanticRequestTerminalV1::kDeadlineExceeded;
+  Finish(std::move(result));
+}
+
+void SelectedSemanticRequestV1::OnDeadline() {
+  if (terminal_) return;
+  SemanticRequestResultV1 result;
+  result.terminal = SemanticRequestTerminalV1::kDeadlineExceeded;
+  Finish(std::move(result));
+}
+
+void SelectedSemanticRequestV1::Cancel() {
+  CHECK(task_runner_->RunsTasksInCurrentSequence());
+  if (terminal_) return;
+  SemanticRequestResultV1 result;
+  result.terminal = SemanticRequestTerminalV1::kCancelled;
+  Finish(std::move(result));
+}
+
+void SelectedSemanticRequestV1::InvalidateEpoch(uint64_t current_epoch) {
+  CHECK(task_runner_->RunsTasksInCurrentSequence());
+  if (terminal_ || current_epoch == epoch_) return;
+  SemanticRequestResultV1 result;
+  result.terminal = SemanticRequestTerminalV1::kStaleContext;
+  Finish(std::move(result));
+}
+
+void SelectedSemanticRequestV1::Finish(SemanticRequestResultV1 result) {
+  if (terminal_) return;
+  terminal_ = true;
+  timer_.Stop();
+  weak_factory_.InvalidateWeakPtrs();
+  result.epoch = epoch_;
+  if (result.terminal != SemanticRequestTerminalV1::kPolicyResult)
+    result.node = {};
+  // Terminal commit is the cancellation linearization point. Later Cancel()
+  // does not retract this immutable queued result. The result and request-added
+  // delivery arguments contain no DOM/request pointers. Callback capture
+  // lifetime remains the caller's responsibility; the client is never called inline.
+  // Delivery is conditional on the documented accepting-runner precondition.
+  // A runner shutdown never turns into inline client code inside frozen AX.
+  task_runner_->PostTask(FROM_HERE,
+      base::BindOnce(std::move(completion_), std::move(result)));
 }
 
 }  // namespace blink
