@@ -258,6 +258,9 @@ class CORE_EXPORT LayoutBox : public LayoutBoxModelObject {
   // This will return PhysicalSize(80, 140).
   virtual PhysicalSize StitchedSize() const;
 
+  // Readiness only: querying this must never compute cached geometry.
+  bool HasCachedSize() const { return HasValidCachedGeometry(); }
+
   void SetLocation(PhysicalOffset location) {
     NOT_DESTROYED();
     if (location == frame_location_) {

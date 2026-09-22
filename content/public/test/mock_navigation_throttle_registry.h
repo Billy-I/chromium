@@ -49,7 +49,9 @@ class MockNavigationThrottleRegistry : public NavigationThrottleRegistry {
 
   // Implements NavigationThrottleRegistry:
   NavigationHandle& GetNavigationHandle() override;
-  void AddThrottle(std::unique_ptr<NavigationThrottle> throttle) override;
+  // This mock supports append-only registration, so first must be false.
+  void AddThrottle(std::unique_ptr<NavigationThrottle> throttle,
+                   bool first = false) override;
 
   // Following methods are not supported in this mock, and returns false always.
   bool HasThrottle(const std::string& name) override;

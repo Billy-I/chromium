@@ -75,6 +75,14 @@ class CORE_EXPORT ViewTransitionSupplement
 
   ViewTransition* GetTransition();
   ViewTransition* GetTransition(const Element&);
+
+  // A conservative, non-preparing barrier for synchronous semantic capture.
+  bool HasPendingOrActiveTransitionsForSemanticCapture() const {
+    return document_transition_ || !element_transitions_.empty() ||
+           !skipped_with_pending_dom_callback_.empty() ||
+           !captured_transitions_.empty() || !pending_requests_.empty() ||
+           pending_navigation_transition_.has_value();
+  }
   void ForEachTransition(base::FunctionRef<void(ViewTransition&)>);
 
   void WillEnterGetComputedStyleScope();

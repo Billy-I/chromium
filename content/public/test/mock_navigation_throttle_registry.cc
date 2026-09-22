@@ -25,8 +25,10 @@ NavigationHandle& MockNavigationThrottleRegistry::GetNavigationHandle() {
 }
 
 void MockNavigationThrottleRegistry::AddThrottle(
-    std::unique_ptr<NavigationThrottle> throttle) {
+    std::unique_ptr<NavigationThrottle> throttle,
+    bool first) {
   CHECK(throttle);
+  CHECK(!first);
   switch (registration_mode_) {
     case RegistrationMode::kAutoRegistrationForTesting:
       GetNavigationHandle().RegisterThrottleForTesting(std::move(throttle));

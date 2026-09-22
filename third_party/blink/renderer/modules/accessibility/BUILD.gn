@@ -50,6 +50,8 @@ blink_modules_sources("accessibility") {
     "inspector_accessibility_agent.h",
     "inspector_type_builder_helper.cc",
     "inspector_type_builder_helper.h",
+    "selected_semantic_policy.cc",
+    "selected_semantic_policy.h",
   ]
 
   deps = [
