@@ -59,6 +59,10 @@ struct SemanticAuditV1 {
   unsigned text_reads = 0;
   unsigned structural_reads = 0;
   unsigned forbidden_reads = 0;
+  // Each count is one visited branch/candidate, never an inferred descendant.
+  unsigned forbidden_structure_prunes = 0;
+  unsigned original_zero_size_exclusions = 0;
+  unsigned original_wholly_offscreen_exclusions = 0;
 };
 
 struct SemanticNodeResultV1 {

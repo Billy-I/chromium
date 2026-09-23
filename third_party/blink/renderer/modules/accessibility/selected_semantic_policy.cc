@@ -157,6 +157,19 @@ namespace {
 
 using Disposition = SemanticDispositionV1;
 
+// Each exclusion event consumes one already-visited AX branch or candidate.
+// A larger total cannot be proven within the document traversal bound.
+bool AccountExclusion(SemanticAuditV1& audit, unsigned& counter) {
+  const uint64_t total =
+      static_cast<uint64_t>(audit.forbidden_structure_prunes) +
+      audit.original_zero_size_exclusions +
+      audit.original_wholly_offscreen_exclusions;
+  if (total >= 256 || counter >= 256)
+    return false;
+  ++counter;
+  return true;
+}
+
 bool ChargeSteps(SemanticBudgetV1& budget, unsigned steps) {
   if (budget.relation_steps > 4096 || steps > 4096 - budget.relation_steps) {
     return false;
@@ -400,7 +413,10 @@ bool MapRectPass(const LayoutBox& source, const LayoutText* contents,
 Disposition MapOwnRect(const LayoutBox& source, const LayoutText* contents,
                        const LayoutView& root, unsigned chain_length,
                        PhysicalRect rect, SemanticBudgetV1& budget,
-                       bool require_full_coverage) {
+                       bool require_full_coverage,
+                       bool* original_wholly_offscreen) {
+  if (original_wholly_offscreen)
+    *original_wholly_offscreen = false;
   if (!ChargeSteps(budget, (require_full_coverage ? 6 : 3) *
                                (chain_length + 1) +
                                (require_full_coverage ? 12 : 6))) {
@@ -410,9 +426,31 @@ Disposition MapOwnRect(const LayoutBox& source, const LayoutText* contents,
     const auto exact = CheckExactMappingDomain(source, root, rect, budget);
     if (exact != Disposition::kAdmitted) return exact;
   }
+  const PhysicalRect own_rect = rect;
   PhysicalRect unclipped = rect;
-  if (!MapRectPass(source, contents, root, rect, kDefaultVisualRectFlags, true))
+  if (!MapRectPass(source, contents, root, rect, kDefaultVisualRectFlags, true)) {
+    // A failed clipped mapping proves no visible intersection only when the
+    // same positive original rect maps successfully with clips skipped.
+    if (original_wholly_offscreen) {
+      if (!require_full_coverage &&
+          !ChargeSteps(budget, 3 * (chain_length + 1) + 6)) {
+        return Disposition::kLimitExceeded;
+      }
+      if (MapRectPass(source, contents, root, unclipped,
+                      kSkipAncestorAndViewportClips, false)) {
+        // The floating-point mapping is a proof only inside the exact 1/64px
+        // domain, even for a button whose admission needs no full coverage.
+        const auto exact = require_full_coverage
+                               ? Disposition::kAdmitted
+                               : CheckExactMappingDomain(source, root, own_rect,
+                                                         budget);
+        if (exact == Disposition::kLimitExceeded)
+          return exact;
+        *original_wholly_offscreen = exact == Disposition::kAdmitted;
+      }
+    }
     return Disposition::kOffscreen;
+  }
   if (require_full_coverage &&
       (!MapRectPass(source, contents, root, unclipped,
                     kSkipAncestorAndViewportClips, false) || rect != unclipped)) {
@@ -464,7 +502,13 @@ Disposition ExistingIdentityInterval(const Text& source, const LayoutText& text,
 
 Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
                              bool require_full_text,
-                             SemanticIdentityLedger* ledger = nullptr) {
+                             SemanticIdentityLedger* ledger = nullptr,
+                             bool* original_wholly_offscreen = nullptr,
+                             bool* original_own_zero_size = nullptr) {
+  if (original_wholly_offscreen)
+    *original_wholly_offscreen = false;
+  if (original_own_zero_size)
+    *original_own_zero_size = false;
   if (object.IsDetached()) {
     return Disposition::kStaleDocument;
   }
@@ -578,6 +622,7 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
     InlineCursor cursor(*fragment);
     bool has_positive_fragment = false;
     bool has_visible_fragment = false;
+    unsigned mapped_fragments = 0;
     for (;;) {
       if (budget.fragments >= 512 || !ChargeSteps(budget, 1)) {
         return Disposition::kLimitExceeded;
@@ -602,16 +647,39 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
       const PhysicalRect rect = cursor.Current().RectInContainerFragment();
       if (!rect.IsEmpty()) {
         has_positive_fragment = true;
+        ++mapped_fragments;
+        bool fragment_wholly_offscreen = false;
         Disposition mapped = MapOwnRect(*text_container, text, *root,
-                                       chain_length, rect, budget, require_full_text);
+                                       chain_length, rect, budget,
+                                       require_full_text,
+                                       original_wholly_offscreen
+                                           ? &fragment_wholly_offscreen
+                                           : nullptr);
         if (mapped == Disposition::kLimitExceeded ||
             (require_full_text && mapped != Disposition::kAdmitted)) {
+          // A single positive fragment can prove the whole text candidate is
+          // outside all clips. For multiple fragments, the early exclusion
+          // does not establish the remaining fragments' original geometry.
+          if (original_wholly_offscreen &&
+              mapped == Disposition::kOffscreen &&
+              fragment_wholly_offscreen &&
+              mapped_fragments == 1 &&
+              !item.DeltaToNextForSameLayoutObject()) {
+            *original_wholly_offscreen = true;
+          }
           return mapped;
         }
         has_visible_fragment |= mapped == Disposition::kAdmitted;
       }
-      if (require_full_text && rect.IsEmpty())
+      if (require_full_text && rect.IsEmpty()) {
+        // A mixed positive/empty text run is excluded, but does not prove
+        // that the original candidate's own geometry is wholly zero-sized.
+        if (original_own_zero_size && !mapped_fragments &&
+            !item.DeltaToNextForSameLayoutObject()) {
+          *original_own_zero_size = true;
+        }
         return Disposition::kOwnZeroSize;
+      }
       const auto delta = item.DeltaToNextForSameLayoutObject();
       if (!delta) {
         break;
@@ -648,10 +716,13 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
   }
   const PhysicalSize size = fragment->Size();
   if (size.width <= LayoutUnit() || size.height <= LayoutUnit()) {
+    if (original_own_zero_size)
+      *original_own_zero_size = true;
     return Disposition::kOwnZeroSize;
   }
   return MapOwnRect(*box, nullptr, *root, chain_length,
-                    PhysicalRect(PhysicalOffset(), size), budget, false);
+                    PhysicalRect(PhysicalOffset(), size), budget, false,
+                    original_wholly_offscreen);
 }
 
 Disposition CaptureState(const Node& source, AXObjectCacheImpl& cache) {
@@ -804,7 +875,9 @@ SemanticNodeResultV1 ReadScopedNode(AXObject& object,
                                     SemanticAuditV1& audit,
                                     SelectedSemanticReadScope& scope,
                                     SemanticIdentityLedger* ledger = nullptr,
-                                    bool* malformed_encoding = nullptr) {
+                                    bool* malformed_encoding = nullptr,
+                                    bool* original_wholly_offscreen = nullptr,
+                                    bool* original_own_zero_size = nullptr) {
   if (object.IsDetached() || !object.GetNode())
     return {Disposition::kStaleDocument, {}};
   Node& node = *object.GetNode();
@@ -823,7 +896,9 @@ SemanticNodeResultV1 ReadScopedNode(AXObject& object,
     Disposition structure = ClassifyStructure(
         node, object.AXObjectCache(), budget, scope, ledger);
     if (structure != Disposition::kAdmitted) return {structure, {}};
-    Disposition geometry = ClassifyGeometry(object, budget, node.IsTextNode(), ledger);
+    Disposition geometry = ClassifyGeometry(
+        object, budget, node.IsTextNode(), ledger,
+        original_wholly_offscreen, original_own_zero_size);
     if (geometry != Disposition::kAdmitted) return {geometry, {}};
     return SelectedSemanticPolicyReadAccess::Content(
         node, scope, budget, audit, malformed_encoding);
@@ -936,15 +1011,30 @@ SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
           if (!ax_layout && !own_layout) return Disposition::kAdmitted;
           if (ax_layout != own_layout) return Disposition::kNotReady;
         }
+        bool original_wholly_offscreen = false;
+        bool original_own_zero_size = false;
         SemanticNodeResultV1 node = ReadScopedNode(
             const_cast<AXObject&>(object), budget, audit, scope, &identities,
-            &malformed_encoding);
+            &malformed_encoding, &original_wholly_offscreen,
+            &original_own_zero_size);
         if (malformed_encoding || !scope.IsClean())
           return Disposition::kUnsupportedText;
         if (node.disposition == Disposition::kStaleDocument ||
             node.disposition == Disposition::kNotReady ||
             node.disposition == Disposition::kLimitExceeded)
           return node.disposition;
+        if (node.disposition == Disposition::kOwnZeroSize &&
+            original_own_zero_size &&
+            !AccountExclusion(audit,
+                              audit.original_zero_size_exclusions)) {
+          return Disposition::kLimitExceeded;
+        }
+        if (node.disposition == Disposition::kOffscreen &&
+            original_wholly_offscreen &&
+            !AccountExclusion(audit,
+                              audit.original_wholly_offscreen_exclusions)) {
+          return Disposition::kLimitExceeded;
+        }
         if (node.disposition != Disposition::kAdmitted)
           return Disposition::kAdmitted;  // Closed local leaf exclusion.
         const auto bytes = node.text.Utf8(Utf8ConversionMode::kStrict);
@@ -971,6 +1061,11 @@ SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
         Disposition structural = ClassifyStructure(
             *const_cast<Node*>(source), cache, budget, scope, &identities,
             /*traverse_container=*/true);
+        if (structural == Disposition::kForbiddenAncestor &&
+            !AccountExclusion(audit,
+                              audit.forbidden_structure_prunes)) {
+          return Disposition::kLimitExceeded;
+        }
         if (structural == Disposition::kForbiddenAncestor ||
             structural == Disposition::kUnsupportedText)
           return Disposition::kAdmitted;  // Entire forbidden subtree.

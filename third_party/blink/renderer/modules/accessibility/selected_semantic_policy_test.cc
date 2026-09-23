@@ -2297,7 +2297,11 @@ TEST_F(SelectedSemanticRequestTest, WebSessionNewCaptureRevokesQueuedSuccess) {
 
 TEST_F(SelectedSemanticRequestTest,
        WebSessionQueuedCancellationPreservesCaptureAudit) {
-  SetReadyBody("<button aria-label='Visible'></button>");
+  SetReadyBody("<button aria-label='Visible'></button>"
+               "<button aria-label='Zero canary' style='appearance:none;"
+               "width:0;height:20px;padding:0;border:0'></button>"
+               "<button aria-label='Offscreen canary' style='position:relative;"
+               "left:900px;width:40px;height:20px'></button>");
   WebSelectedSemanticSession session(
       WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
   std::vector<WebSelectedSemanticCaptureV1> results;
@@ -2315,6 +2319,8 @@ TEST_F(SelectedSemanticRequestTest,
   EXPECT_EQ(1u, results[0].audit.text_reads);
   EXPECT_EQ(0u, results[0].audit.forbidden_reads);
   EXPECT_EQ(7u, results[0].budget.utf8_bytes);
+  EXPECT_EQ(1u, results[0].audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, results[0].audit.original_wholly_offscreen_exclusions);
 }
 
 TEST_F(SelectedSemanticRequestTest, WebSessionCancelRevokesQueuedAndDeliveredSlots) {
@@ -2409,6 +2415,205 @@ TEST_F(SelectedSemanticRequestTest,
 }
 
 TEST_F(SelectedSemanticRequestTest,
+       WebSessionReportsSourceBackedExclusionCounts) {
+  SetReadyBody(
+      "<style>html,body{overflow:hidden}</style>"
+      "<p>Allowed positive</p>"
+      "<div aria-hidden=true><button aria-label='AX-pruned canary'></button></div>"
+      "<div contenteditable=true>Editable subtree canary</div>"
+      "<button aria-label='Zero canary' style='appearance:none;width:0;"
+      "height:20px;padding:0;border:0;overflow:visible'></button>"
+      "<button aria-label='Offscreen canary' style='position:relative;"
+      "left:900px;width:40px;height:20px'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  const auto& result = results.front();
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted, result.disposition);
+  ASSERT_EQ(1u, result.entries.size());
+  EXPECT_EQ(WebSelectedSemanticRoleV1::kText, result.entries[0].role);
+  EXPECT_EQ("Allowed positive", result.entries[0].text);
+  EXPECT_EQ(0u, result.entries[0].button_slot);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  EXPECT_EQ(1u, result.audit.forbidden_structure_prunes);
+  EXPECT_EQ(1u, result.audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, result.audit.original_wholly_offscreen_exclusions);
+  EXPECT_LE(result.budget.nodes, 256u);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionCountsWholeClipNotPartialClipOrUnsupported) {
+  LoadAhem();
+  SetReadyBody(
+      "<p>Allowed positive</p>"
+      "<div style='overflow:hidden;width:100px;height:40px'>"
+      "<button aria-label='Clipped canary' style='position:relative;"
+      "left:120px;width:40px;height:20px'></button></div>"
+      "<div style='width:20px;overflow:hidden'>"
+      "<p style='font:10px/12px Ahem;width:200px;white-space:pre'>"
+      "Partially clipped text</p></div>"
+      "<button aria-label='Unsupported canary' style='transform:rotate(20deg)'>"
+      "</button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  const auto& result = results.front();
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted, result.disposition);
+  ASSERT_EQ(1u, result.entries.size());
+  EXPECT_EQ("Allowed positive", result.entries[0].text);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_structure_prunes);
+  EXPECT_EQ(0u, result.audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, result.audit.original_wholly_offscreen_exclusions);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionExclusionCountCannotOutrunTraversalBound) {
+  StringBuilder html;
+  html.Append("<p>Allowed positive</p>");
+  // Group children so the >256 AX descendants are traversed before the
+  // per-parent child-count guard rejects the document.
+  for (unsigned group = 0; group < 9; ++group) {
+    html.Append("<div role=group>");
+    for (unsigned i = 0; i < 29; ++i) {
+      html.Append("<button aria-label='Zero canary' style='appearance:none;"
+                  "width:0;height:20px;padding:0;border:0'></button>");
+    }
+    html.Append("</div>");
+  }
+  SetReadyBody(html.ToString());
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult,
+            results[0].terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kLimitExceeded,
+            results[0].disposition);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_EQ(0u, results[0].reserved_output_bytes);
+  EXPECT_EQ(0u, results[0].audit.forbidden_reads);
+  EXPECT_GT(results[0].audit.original_zero_size_exclusions, 0u);
+  EXPECT_LE(results[0].audit.forbidden_structure_prunes +
+                results[0].audit.original_zero_size_exclusions +
+                results[0].audit.original_wholly_offscreen_exclusions,
+            256u);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionDoesNotCountOutOfDomainOffscreenButton) {
+  SetReadyBody(
+      "<style>html,body{overflow:hidden}</style>"
+      "<p>Allowed positive</p>"
+      "<div style='position:relative;left:-32718px'>"
+      "<button aria-label='Unproven offscreen canary' style='position:relative;"
+      "left:40000px;width:40px;height:20px'></button></div>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  const auto& result = results.front();
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted, result.disposition);
+  ASSERT_EQ(1u, result.entries.size());
+  EXPECT_EQ("Allowed positive", result.entries[0].text);
+  EXPECT_EQ(0u, result.entries[0].button_slot);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  EXPECT_EQ(0u, result.audit.original_wholly_offscreen_exclusions);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionMixedEmptyTextFragmentIsExcludedWithoutZeroSizeClaim) {
+  SetReadyBody("<p>Allowed positive</p>"
+               "<p id=mixed style='white-space:pre-wrap'>\nB</p>");
+  auto* text = To<Text>(GetElementById("mixed")->firstChild());
+  auto* layout_text = DynamicTo<LayoutText>(text->GetLayoutObject());
+  ASSERT_NE(nullptr, layout_text);
+  const auto* container = layout_text->FragmentItemsContainer();
+  ASSERT_NE(nullptr, container);
+  const auto* fragment = container->GetPhysicalFragment(0);
+  ASSERT_NE(nullptr, fragment);
+  const auto* items = fragment->Items();
+  ASSERT_NE(nullptr, items);
+  const auto span = items->Items();
+  const auto first = layout_text->FirstInlineFragmentItemIndex();
+  ASSERT_GT(first, 0u);
+  ASSERT_TRUE(span[first - 1].RectInContainerFragment().IsEmpty());
+  unsigned index = first - 1;
+  unsigned positive = 0;
+  unsigned empty = 0;
+  for (;;) {
+    ASSERT_LT(index, span.size());
+    const auto& item = span[index];
+    ASSERT_EQ(layout_text, item.GetLayoutObject());
+    ASSERT_EQ(FragmentItem::kText, item.Type());
+    if (item.RectInContainerFragment().IsEmpty())
+      ++empty;
+    else
+      ++positive;
+    const auto delta = item.DeltaToNextForSameLayoutObject();
+    if (!delta)
+      break;
+    index += delta;
+  }
+  ASSERT_GT(positive, 0u);
+  ASSERT_GT(empty, 0u);
+
+  auto node_results = std::make_shared<Results>();
+  auto node_request = Request(*text, node_results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, node_results->size());
+  // The flow-control newline fails exact text identity before the geometry
+  // classifier; mixed fragments therefore cannot support a zero-size claim.
+  EXPECT_EQ(SemanticDispositionV1::kUnsupportedText,
+            node_results->front().node.disposition);
+  EXPECT_EQ(0u, node_results->front().audit.text_reads);
+
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(8, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult,
+            results[0].terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted,
+            results[0].disposition);
+  ASSERT_EQ(1u, results[0].entries.size());
+  EXPECT_EQ("Allowed positive", results[0].entries[0].text);
+  EXPECT_EQ(0u, results[0].entries[0].button_slot);
+  EXPECT_EQ(1u, results[0].audit.text_reads);
+  EXPECT_EQ(0u, results[0].audit.forbidden_reads);
+  EXPECT_EQ(0u, results[0].audit.original_zero_size_exclusions);
+}
+
+TEST_F(SelectedSemanticRequestTest,
        WebSessionPostCaptureMutationSuppressesQueuedTextAndSlots) {
   SetReadyBody("<button id=first aria-label='Original'></button>");
   WebSelectedSemanticSession session(
@@ -2429,7 +2634,12 @@ TEST_F(SelectedSemanticRequestTest,
 
 TEST_F(SelectedSemanticRequestTest,
        WebSessionQueuedMutationPreservesCaptureAudit) {
-  SetReadyBody("<button id=target aria-label='Visible'></button>");
+  SetReadyBody("<button id=target aria-label='Visible'></button>"
+               "<div contenteditable=true>Editable subtree canary</div>"
+               "<button aria-label='Zero canary' style='appearance:none;"
+               "width:0;height:20px;padding:0;border:0'></button>"
+               "<button aria-label='Offscreen canary' style='position:relative;"
+               "left:900px;width:40px;height:20px'></button>");
   WebSelectedSemanticSession session(
       WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
   std::vector<WebSelectedSemanticCaptureV1> results;
@@ -2449,6 +2659,9 @@ TEST_F(SelectedSemanticRequestTest,
   EXPECT_EQ(1u, results[0].audit.text_reads);
   EXPECT_EQ(0u, results[0].audit.forbidden_reads);
   EXPECT_EQ(7u, results[0].budget.utf8_bytes);
+  EXPECT_EQ(1u, results[0].audit.forbidden_structure_prunes);
+  EXPECT_EQ(1u, results[0].audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, results[0].audit.original_wholly_offscreen_exclusions);
 }
 
 TEST_F(SelectedSemanticRequestTest,

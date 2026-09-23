@@ -215,8 +215,12 @@ class WebSelectedSemanticSession::Impl {
                 SemanticRequestResultV1 result) {
     CHECK(IsMainThread() && runner_->RunsTasksInCurrentSequence());
     WebSelectedSemanticCaptureV1 output;
-    output.audit = {result.audit.text_reads, result.audit.structural_reads,
-                    result.audit.forbidden_reads};
+    output.audit = {result.audit.text_reads,
+                    result.audit.structural_reads,
+                    result.audit.forbidden_reads,
+                    result.audit.forbidden_structure_prunes,
+                    result.audit.original_zero_size_exclusions,
+                    result.audit.original_wholly_offscreen_exclusions};
     output.budget = {result.budget.nodes, result.budget.depth,
                      result.budget.fragments, result.budget.relation_steps,
                      result.budget.utf8_bytes};

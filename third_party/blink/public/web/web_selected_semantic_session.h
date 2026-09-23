@@ -55,6 +55,14 @@ struct WebSelectedSemanticAuditV1 {
   unsigned text_reads = 0;
   unsigned structural_reads = 0;
   unsigned forbidden_reads = 0;
+  // One visited forbidden structural branch, counted without its descendants.
+  unsigned forbidden_structure_prunes = 0;
+  // One text/button candidate excluded by its own zero-size geometry.
+  unsigned original_zero_size_exclusions = 0;
+  // One candidate whose positive original geometry has no intersection after
+  // applicable ancestor clips and the root viewport. Partial clips and
+  // unverified mappings are not counted.
+  unsigned original_wholly_offscreen_exclusions = 0;
 };
 
 struct WebSelectedSemanticBudgetV1 {
