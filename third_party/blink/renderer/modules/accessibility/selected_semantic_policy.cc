@@ -28,6 +28,7 @@
 #include "third_party/blink/renderer/core/layout/layout_text.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/layout/physical_box_fragment.h"
+#include "third_party/blink/renderer/core/page/chrome_client.h"
 #include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/paint/paint_layer.h"
 #include "third_party/blink/renderer/core/paint/paint_layer_scrollable_area.h"
@@ -294,7 +295,8 @@ Disposition CheckMappingObject(const LayoutObject& layout,
   if (style.TransformStyle3D() != ETransformStyle3D::kFlat ||
       style.HasTransformRelatedProperty() || style.HasFilter() ||
       style.HasBackdropFilter() || layout.HasReflection() ||
-      style.Opacity() != 1 || style.EffectiveZoom() != 1 ||
+      style.Opacity() != 1 ||
+      style.EffectiveZoom() != root.StyleRef().EffectiveZoom() ||
       style.HasCurrentOpacityAnimation() || style.HasCurrentFilterAnimation() ||
       style.HasCurrentBackdropFilterAnimation() ||
       style.HasCurrentClipPathAnimation() ||
@@ -535,15 +537,27 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
     return Disposition::kNotReady;
   }
   const auto* transitions = document.GetViewTransitionsIfExists();
-  if (document.Printing() || !frame->IsOutermostMainFrame() ||
-      frame->LayoutZoomFactor() != 1 || !document.GetPage() ||
+  Page* page = document.GetPage();
+  if (document.Printing() || !frame->IsOutermostMainFrame() || !page ||
       (transitions &&
        transitions->HasPendingOrActiveTransitionsForSemanticCapture()) ||
       (document.GetSettings() && document.GetSettings()
                                      ->GetPlaceRTLScrollbarsOnLeftSideInMainFrame())) {
     return Disposition::kUnsupportedGeometry;
   }
-  const auto& viewport = document.GetPage()->GetVisualViewport();
+  const float device_scale =
+      page->GetChromeClient().ZoomFactorForViewportLayout();
+  // StyleResolver seeds EffectiveZoom from LayoutZoomFactor. A pure device
+  // scale changes layout coordinates but introduces no extra mapping across
+  // the flat, same-scale chain. User, widget CSS and descendant CSS zoom stay
+  // outside this source-geometry proof.
+  if (!std::isfinite(device_scale) || device_scale <= 0 ||
+      frame->LayoutZoomFactor() != device_scale ||
+      frame->CssZoomFactor() != 1 ||
+      page->GetChromeClient().UserZoomFactor(frame) != 1) {
+    return Disposition::kUnsupportedGeometry;
+  }
+  const auto& viewport = page->GetVisualViewport();
   if (viewport.Scale() != 1 || viewport.GetScrollOffset() != ScrollOffset() ||
       viewport.IsPinchGestureActive() || viewport.BrowserControlsAdjustment() ||
       viewport.GetDeviceEmulationTransformNode() ||
@@ -558,6 +572,8 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
       budget.fragments >= 512) {
     return root ? Disposition::kLimitExceeded : Disposition::kNotReady;
   }
+  if (root->StyleRef().EffectiveZoom() != device_scale)
+    return Disposition::kUnsupportedGeometry;
   const auto* text = DynamicTo<LayoutText>(layout);
   if (text && (!node->IsTextNode() || text->IsTextFragment() || text->IsSVG() ||
                !text->IsInLayoutNGInlineFormattingContext())) {

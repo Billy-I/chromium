@@ -4,6 +4,7 @@
 
 #include "third_party/blink/public/web/web_selected_semantic_session.h"
 
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -22,6 +23,8 @@
 #include "third_party/blink/renderer/core/frame/local_frame.h"
 #include "third_party/blink/renderer/core/frame/local_frame_view.h"
 #include "third_party/blink/renderer/core/html_names.h"
+#include "third_party/blink/renderer/core/page/chrome_client.h"
+#include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/modules/accessibility/ax_object_cache_impl.h"
 #include "third_party/blink/renderer/modules/accessibility/selected_semantic_policy.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
@@ -127,6 +130,7 @@ class WebSelectedSemanticSession::Impl {
       PostResult(std::move(state), std::move(callback), std::move(result));
       return;
     }
+    state->device_scale = CurrentPureDeviceScale();
     capture_cache_ = cache;
     request_ = SelectedSemanticRequestV1::CreateDocument(
         *document_, *cache, epoch, deadline, runner_,
@@ -141,8 +145,11 @@ class WebSelectedSemanticSession::Impl {
 
   bool HasLiveButtonSlot(uint64_t slot) const {
     CHECK(IsMainThread() && runner_->RunsTasksInCurrentSequence());
+    const auto device_scale = CurrentPureDeviceScale();
     if (!slot || !request_ || !captured_tree_version_ ||
         !captured_style_version_ || !captured_layout_generation_ ||
+        !captured_device_scale_ || !device_scale ||
+        *captured_device_scale_ != *device_scale ||
         !HasCurrentDocument() || !document_->View() ||
         document_->DomTreeVersion() != *captured_tree_version_ ||
         document_->StyleVersion() != *captured_style_version_ ||
@@ -164,6 +171,7 @@ class WebSelectedSemanticSession::Impl {
   struct CaptureState {
     std::optional<WebSelectedSemanticTerminalV1> revoked;
     base::TimeTicks deadline;
+    std::optional<float> device_scale;
   };
   struct SlotBinding {
     uint64_t slot;
@@ -177,6 +185,23 @@ class WebSelectedSemanticSession::Impl {
            document_->GetFrame() == frame_.Get() &&
            document_->Token() == *document_token_ &&
            frame_->GetLocalFrameToken() == *frame_token_;
+  }
+
+  std::optional<float> CurrentPureDeviceScale() const {
+    if (!HasCurrentDocument())
+      return std::nullopt;
+    Page* page = document_->GetPage();
+    if (!page)
+      return std::nullopt;
+    const float device_scale =
+        page->GetChromeClient().ZoomFactorForViewportLayout();
+    if (!std::isfinite(device_scale) || device_scale <= 0 ||
+        frame_->LayoutZoomFactor() != device_scale ||
+        frame_->CssZoomFactor() != 1 ||
+        page->GetChromeClient().UserZoomFactor(frame_.Get()) != 1) {
+      return std::nullopt;
+    }
+    return device_scale;
   }
 
   bool IsCurrentButtonSource(Node* node) const {
@@ -194,6 +219,7 @@ class WebSelectedSemanticSession::Impl {
     captured_tree_version_.reset();
     captured_style_version_.reset();
     captured_layout_generation_.reset();
+    captured_device_scale_.reset();
     capture_cache_ = nullptr;
     if (request_) {
       request_->Cancel();
@@ -245,7 +271,10 @@ class WebSelectedSemanticSession::Impl {
     if (result.terminal == SemanticRequestTerminalV1::kPolicyResult) {
       output.disposition = ToWebDisposition(result.observation.disposition);
       if (result.observation.disposition == SemanticDispositionV1::kAdmitted) {
-        if (!request_ || !HasCurrentDocument() || !capture_cache_ ||
+        const auto device_scale = CurrentPureDeviceScale();
+        if (!request_ || !state->device_scale || !device_scale ||
+            *state->device_scale != *device_scale ||
+            !HasCurrentDocument() || !capture_cache_ ||
             document_->ExistingAXObjectCache() != capture_cache_.Get() ||
             !result.document_tree_version || !result.document_style_version ||
             !result.document_layout_generation || !document_->View() ||
@@ -259,7 +288,7 @@ class WebSelectedSemanticSession::Impl {
           CloseWithoutPageData(output,
                                WebSelectedSemanticTerminalV1::kStaleContext);
         } else {
-          PopulateAdmitted(result, output);
+          PopulateAdmitted(result, *device_scale, output);
         }
       }
     }
@@ -271,6 +300,7 @@ class WebSelectedSemanticSession::Impl {
   }
 
   void PopulateAdmitted(const SemanticRequestResultV1& result,
+                        float device_scale,
                         WebSelectedSemanticCaptureV1& output) {
     auto bindings = request_->TakeButtonBindings();
     if (next_slot_ > std::numeric_limits<uint64_t>::max() - bindings.size()) {
@@ -315,6 +345,7 @@ class WebSelectedSemanticSession::Impl {
     captured_tree_version_ = result.document_tree_version;
     captured_style_version_ = result.document_style_version;
     captured_layout_generation_ = result.document_layout_generation;
+    captured_device_scale_ = device_scale;
     output.reserved_output_bytes = result.observation.reserved_output_bytes;
   }
 
@@ -326,6 +357,7 @@ class WebSelectedSemanticSession::Impl {
   std::optional<uint64_t> captured_tree_version_;
   std::optional<uint64_t> captured_style_version_;
   std::optional<uint64_t> captured_layout_generation_;
+  std::optional<float> captured_device_scale_;
   scoped_refptr<base::SingleThreadTaskRunner> runner_;
   std::unique_ptr<SelectedSemanticRequestV1> request_;
   std::shared_ptr<CaptureState> active_;

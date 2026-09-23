@@ -31,6 +31,7 @@
 #include "third_party/blink/renderer/core/dom/text.h"
 #include "third_party/blink/renderer/core/frame/frame_test_helpers.h"
 #include "third_party/blink/renderer/core/frame/local_frame_view.h"
+#include "third_party/blink/renderer/core/frame/web_frame_widget_impl.h"
 #include "third_party/blink/renderer/core/html/html_body_element.h"
 #include "third_party/blink/renderer/core/html/html_style_element.h"
 #include "third_party/blink/renderer/core/frame/visual_viewport.h"
@@ -45,6 +46,7 @@
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/loader/resource/image_resource_content.h"
 #include "third_party/blink/renderer/core/page/page.h"
+#include "third_party/blink/renderer/core/page/chrome_client.h"
 #include "third_party/blink/renderer/core/paint/paint_layer_scrollable_area.h"
 #include "third_party/blink/renderer/core/testing/scoped_mock_overlay_scrollbars.h"
 #include "third_party/blink/renderer/core/testing/dummy_page_holder.h"
@@ -73,6 +75,8 @@
 #include "ui/accessibility/ax_mode.h"
 #include "ui/gfx/geometry/size.h"
 #include "third_party/blink/renderer/core/dom/document.h"
+#include "third_party/blink/renderer/core/dom/events/native_event_listener.h"
+#include "third_party/blink/renderer/core/event_type_names.h"
 #include "third_party/blink/renderer/core/frame/local_frame.h"
 #include "third_party/blink/renderer/core/resize_observer/resize_observer.h"
 #include "third_party/blink/renderer/core/resize_observer/resize_observer_entry.h"
@@ -83,6 +87,7 @@
 #include "third_party/blink/renderer/core/layout/inline/fragment_item.h"
 #include "third_party/blink/renderer/core/layout/inline/fragment_items.h"
 #include "third_party/blink/renderer/core/testing/sim/sim_request.h"
+#include "third_party/blink/renderer/core/testing/sim/sim_page.h"
 #include "third_party/blink/renderer/core/testing/sim/sim_test.h"
 #include "third_party/blink/renderer/platform/wtf/text/atomic_string.h"
 #include "third_party/blink/renderer/platform/wtf/casting.h"
@@ -93,6 +98,7 @@
 #include "base/functional/bind.h"
 #include "base/test/task_environment.h"
 #include "base/time/tick_clock.h"
+#include "ui/accessibility/ax_action_data.h"
 #include "third_party/blink/renderer/platform/wtf/wtf.h"
 #include "third_party/skia/include/core/SkImage.h"
 #include "third_party/skia/include/core/SkSurface.h"
@@ -2273,6 +2279,51 @@ TEST_F(SelectedSemanticRequestTest, WebSessionBindsOnlyLiveAdmittedButtons) {
   EXPECT_EQ(0u, result.audit.forbidden_reads);
 }
 
+// Diagnostic only: a fixed-size status slot is a proposed action-fixture
+// constraint, not part of the accepted fixture or a guarded action proof.
+TEST_F(SelectedSemanticRequestTest,
+       SizeContainedStatusCandidateMustPassFrozenCapture) {
+  SetReadyBody("<div id=status style='width:150px;height:60px;overflow:hidden;"
+               "contain:size'><p style='margin:0;font:16px/20px sans-serif'>"
+               "pending</p></div><button aria-label='Press'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult,
+            results[0].terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted,
+            results[0].disposition);
+  ASSERT_EQ(2u, results[0].entries.size());
+  EXPECT_EQ("pending", results[0].entries[0].text);
+  EXPECT_EQ("Press", results[0].entries[1].text);
+
+  auto* status = GetElementById("status");
+  ASSERT_NE(nullptr, status);
+  auto* paragraph = status->firstElementChild();
+  ASSERT_NE(nullptr, paragraph);
+  auto* text = DynamicTo<Text>(paragraph->firstChild());
+  ASSERT_NE(nullptr, text);
+  text->setData("complete");
+  GetDocument().UpdateStyleAndLayout(DocumentUpdateReason::kTest);
+  session.Capture(8, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(2u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult,
+            results[1].terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted,
+            results[1].disposition);
+  ASSERT_EQ(2u, results[1].entries.size());
+  EXPECT_EQ("complete", results[1].entries[0].text);
+  EXPECT_EQ("Press", results[1].entries[1].text);
+}
+
 TEST_F(SelectedSemanticRequestTest, WebSessionNewCaptureRevokesQueuedSuccess) {
   SetReadyBody("<button aria-label='First'></button>");
   WebSelectedSemanticSession session(
@@ -2448,6 +2499,297 @@ TEST_F(SelectedSemanticRequestTest,
   EXPECT_LE(result.budget.nodes, 256u);
 }
 
+// Reproduce the selected page from the CEF two-view consumer with an actual
+// HTML document parse. A paragraph control must not conceal button loss.
+class SelectedSemanticLiveFixtureParityTest : public SimTest {
+ protected:
+  void TearDown() override {
+    ax_context_.reset();
+    SimTest::TearDown();
+  }
+
+  void LoadSelectedPage(bool paragraph_before_buttons,
+                        bool force_ax_priming = true,
+                        bool cef_ax_mode = false,
+                        float device_scale_factor = 1.0f,
+                        bool body_css_zoom = false) {
+    constexpr char kURL[] = "https://lunar-policy.test/selected-parity";
+    ResizeView(gfx::Size(900, 618));
+    SimRequest resource(kURL, "text/html");
+    LoadURL(kURL);
+    GetPage().SetFocused(true);
+    StringBuilder html;
+    html.Append("<html><style>html,body{overflow:hidden}</style>"
+                "<body style='margin:0");
+    if (body_css_zoom)
+      html.Append(";zoom:2");
+    html.Append("'>");
+    if (paragraph_before_buttons)
+      html.Append("<p>known-positive-paragraph</p>");
+    html.Append(
+        "<button aria-label='selected-lunar-alpha' "
+        "style='width:200px;height:32px'>selected-lunar-alpha"
+        "</button>"
+        "<div contenteditable=true>editable-lunar-canary</div>"
+        "<button aria-label='zero-lunar-canary' style='appearance:none;"
+        "width:0;height:20px;padding:0;border:0;overflow:visible'>"
+        "</button>"
+        "<button aria-label='offscreen-lunar-canary' "
+        "style='position:relative;left:900px;width:40px;height:20px'>"
+        "</button></body></html>");
+    resource.Complete(html.ToString());
+    WebView().SetZoomFactorForDeviceScaleFactor(device_scale_factor, 1.0f);
+    ax_context_ = std::make_unique<AXContext>(
+        GetDocument(),
+        cef_ax_mode ? ui::kAXModeComplete : ui::kAXModeDefaultForTests);
+    cache_ = To<AXObjectCacheImpl>(GetDocument().ExistingAXObjectCache());
+    ASSERT_NE(nullptr, cache_.Get());
+    if (force_ax_priming) {
+      cache_->MarkDocumentDirty();
+      cache_->UpdateAXForAllDocuments();
+    }
+  }
+
+  void Capture(std::vector<WebSelectedSemanticCaptureV1>& results,
+               bool force_ax_priming = true) {
+    WebSelectedSemanticSession session(
+        WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+    session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                    base::BindOnce(&RecordWebCapture, &results));
+    if (force_ax_priming) {
+      cache_->MarkDocumentDirty();
+      cache_->UpdateAXForAllDocuments();
+    } else {
+      // SimTest needs an explicit compositor frame to service the requested
+      // lifecycle callback; this is not a manual AX dirty/update call.
+      Compositor().BeginFrame();
+    }
+    task_environment().RunUntilIdle();
+  }
+
+  std::unique_ptr<AXContext> ax_context_;
+  WeakPersistent<AXObjectCacheImpl> cache_;
+};
+
+void ExpectSelectedLiveFixtureResult(const WebSelectedSemanticCaptureV1& result,
+                                     bool paragraph_before_buttons) {
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted, result.disposition);
+  unsigned selected_buttons = 0;
+  unsigned control_paragraphs = 0;
+  for (const auto& entry : result.entries) {
+    if (entry.role == WebSelectedSemanticRoleV1::kButton &&
+        entry.text == "selected-lunar-alpha") {
+      ++selected_buttons;
+      EXPECT_NE(0u, entry.button_slot);
+    }
+    if (entry.role == WebSelectedSemanticRoleV1::kText &&
+        entry.text == "known-positive-paragraph") {
+      ++control_paragraphs;
+    }
+    EXPECT_NE("zero-lunar-canary", entry.text);
+    EXPECT_NE("offscreen-lunar-canary", entry.text);
+    EXPECT_NE("editable-lunar-canary", entry.text);
+  }
+  EXPECT_EQ(1u, selected_buttons);
+  EXPECT_EQ(paragraph_before_buttons ? 1u : 0u, control_paragraphs);
+  EXPECT_EQ(1u, result.audit.forbidden_structure_prunes);
+  EXPECT_EQ(1u, result.audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, result.audit.original_wholly_offscreen_exclusions);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest, ExactCefSelectedPage) {
+  LoadSelectedPage(false);
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results);
+  ASSERT_EQ(1u, results.size());
+  ExpectSelectedLiveFixtureResult(results.front(), false);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       ExactCefSelectedPageWithParagraphControl) {
+  LoadSelectedPage(true);
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results);
+  ASSERT_EQ(1u, results.size());
+  ExpectSelectedLiveFixtureResult(results.front(), true);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       ExactCefSelectedPageWithoutForcedAXPriming) {
+  LoadSelectedPage(false, false);
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  ExpectSelectedLiveFixtureResult(results.front(), false);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       ExactCefSelectedPageCefAXModeWithoutForcedPriming) {
+  LoadSelectedPage(false, false, true);
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  ExpectSelectedLiveFixtureResult(results.front(), false);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       ExactCefSelectedPageAtRetinaDeviceScale) {
+  LoadSelectedPage(false, false, true, 2.0f);
+  ASSERT_EQ(2.0f, GetDocument().GetFrame()->LayoutZoomFactor());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  ExpectSelectedLiveFixtureResult(results.front(), false);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       ParagraphAndButtonsAtFractionalDeviceScale) {
+  LoadSelectedPage(true, false, true, 1.25f);
+  ASSERT_EQ(1.25f, GetDocument().GetFrame()->LayoutZoomFactor());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  ExpectSelectedLiveFixtureResult(results.front(), true);
+  EXPECT_EQ(2u, results.front().audit.text_reads);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       RetinaDeviceScaleDoesNotAdmitUserZoom) {
+  LoadSelectedPage(false, false, true, 2.0f);
+  WebView().MainFrameWidget()->SetZoomLevel(1.0);
+  ASSERT_NE(2.0f, GetDocument().GetFrame()->LayoutZoomFactor());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  EXPECT_TRUE(results.front().entries.empty());
+  EXPECT_EQ(0u, results.front().audit.text_reads);
+  EXPECT_EQ(0u, results.front().audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       RetinaDeviceScaleRejectsUserZoomEvenWhenLayoutFloatAliases) {
+  LoadSelectedPage(false, false, true, 2.0f);
+  WebView().MainFrameWidget()->SetZoomLevel(1e-8);
+  ASSERT_EQ(2.0f, GetDocument().GetFrame()->LayoutZoomFactor());
+  ASSERT_NE(1.0, GetDocument().GetPage()->GetChromeClient().UserZoomFactor(
+                     GetDocument().GetFrame()));
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  EXPECT_TRUE(results.front().entries.empty());
+  EXPECT_EQ(0u, results.front().audit.text_reads);
+  EXPECT_EQ(0u, results.front().audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       QueuedRetinaCaptureRejectsAliasedUserZoomAndPreservesAudit) {
+  LoadSelectedPage(false, true, false, 2.0f);
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  cache_->MarkDocumentDirty();
+  cache_->UpdateAXForAllDocuments();
+  ASSERT_TRUE(results.empty());
+  const uint64_t tree_version = GetDocument().DomTreeVersion();
+  const uint64_t style_version = GetDocument().StyleVersion();
+  const uint64_t layout_generation =
+      GetDocument().View()->LayoutGenerationForSelectedSemantic();
+  WebView().MainFrameWidget()->SetZoomLevel(1e-8);
+  ASSERT_EQ(2.0f, GetDocument().GetFrame()->LayoutZoomFactor());
+  ASSERT_NE(1.0, GetDocument().GetPage()->GetChromeClient().UserZoomFactor(
+                     GetDocument().GetFrame()));
+  ASSERT_EQ(tree_version, GetDocument().DomTreeVersion());
+  ASSERT_EQ(style_version, GetDocument().StyleVersion());
+  ASSERT_EQ(layout_generation,
+            GetDocument().View()->LayoutGenerationForSelectedSemantic());
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results.front().terminal);
+  EXPECT_TRUE(results.front().entries.empty());
+  EXPECT_EQ(0u, results.front().reserved_output_bytes);
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+  EXPECT_EQ(1u, results.front().audit.text_reads);
+  EXPECT_EQ(0u, results.front().audit.forbidden_reads);
+  EXPECT_EQ(1u, results.front().audit.forbidden_structure_prunes);
+  EXPECT_EQ(1u, results.front().audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, results.front().audit.original_wholly_offscreen_exclusions);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       DeliveredRetinaSlotRejectsAliasedUserZoom) {
+  LoadSelectedPage(false, true, false, 2.0f);
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  cache_->MarkDocumentDirty();
+  cache_->UpdateAXForAllDocuments();
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, results.size());
+  ASSERT_EQ(1u, results.front().entries.size());
+  const uint64_t slot = results.front().entries.front().button_slot;
+  ASSERT_NE(0u, slot);
+  ASSERT_TRUE(session.HasLiveButtonSlot(slot));
+  const uint64_t tree_version = GetDocument().DomTreeVersion();
+  const uint64_t style_version = GetDocument().StyleVersion();
+  const uint64_t layout_generation =
+      GetDocument().View()->LayoutGenerationForSelectedSemantic();
+  WebView().MainFrameWidget()->SetZoomLevel(1e-8);
+  ASSERT_EQ(2.0f, GetDocument().GetFrame()->LayoutZoomFactor());
+  ASSERT_NE(1.0, GetDocument().GetPage()->GetChromeClient().UserZoomFactor(
+                     GetDocument().GetFrame()));
+  ASSERT_EQ(tree_version, GetDocument().DomTreeVersion());
+  ASSERT_EQ(style_version, GetDocument().StyleVersion());
+  ASSERT_EQ(layout_generation,
+            GetDocument().View()->LayoutGenerationForSelectedSemantic());
+  EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       QueuedRetinaCaptureRejectsDeviceScaleChange) {
+  LoadSelectedPage(false, true, false, 2.0f);
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  cache_->MarkDocumentDirty();
+  cache_->UpdateAXForAllDocuments();
+  ASSERT_TRUE(results.empty());
+  WebView().SetZoomFactorForDeviceScaleFactor(1.25f, 1.0f);
+  ASSERT_EQ(1.25f, GetDocument().GetFrame()->LayoutZoomFactor());
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results.front().terminal);
+  EXPECT_TRUE(results.front().entries.empty());
+  EXPECT_EQ(0u, results.front().reserved_output_bytes);
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+  EXPECT_EQ(1u, results.front().audit.text_reads);
+  EXPECT_EQ(0u, results.front().audit.forbidden_reads);
+  EXPECT_EQ(1u, results.front().audit.forbidden_structure_prunes);
+  EXPECT_EQ(1u, results.front().audit.original_zero_size_exclusions);
+  EXPECT_EQ(1u, results.front().audit.original_wholly_offscreen_exclusions);
+}
+
+TEST_F(SelectedSemanticLiveFixtureParityTest,
+       RetinaDeviceScaleDoesNotAdmitCssZoom) {
+  LoadSelectedPage(false, false, true, 2.0f, true);
+  ASSERT_EQ(2.0f, GetDocument().GetFrame()->LayoutZoomFactor());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  Capture(results, false);
+  ASSERT_EQ(1u, results.size());
+  EXPECT_TRUE(results.front().entries.empty());
+  EXPECT_EQ(0u, results.front().audit.text_reads);
+  EXPECT_EQ(0u, results.front().audit.forbidden_reads);
+}
+
 TEST_F(SelectedSemanticRequestTest,
        WebSessionCountsWholeClipNotPartialClipOrUnsupported) {
   LoadAhem();
@@ -2611,6 +2953,289 @@ TEST_F(SelectedSemanticRequestTest,
   EXPECT_EQ(1u, results[0].audit.text_reads);
   EXPECT_EQ(0u, results[0].audit.forbidden_reads);
   EXPECT_EQ(0u, results[0].audit.original_zero_size_exclusions);
+}
+
+// RED prototype for the service-only guard. These tests intentionally call
+// Chromium's current native AX default path to pin its script stages before
+// Task4b changes that path; they are not a public action interface.
+class SelectedSemanticActionPrototypeTest : public SimTest {
+ protected:
+  void TearDown() override {
+    ax_context_.reset();
+    SimTest::TearDown();
+  }
+
+  void LoadPrototype(const char* button_type, const char* handlers) {
+    constexpr char kURL[] = "https://lunar-policy.test/action-prototype";
+    ResizeView(gfx::Size(800, 600));
+    SimRequest resource(kURL, "text/html");
+    LoadURL(kURL);
+    GetPage().SetFocused(true);
+    StringBuilder html;
+    html.Append("<!doctype html><html><body><form id=form><button id=target type='");
+    html.Append(button_type);
+    html.Append("' aria-label='Press'></button></form>"
+                "<p id=status>pending</p><p id=clicks>0</p>"
+                "<p id=pointerdowns>0</p><p id=submits>0</p><script>"
+                "const button=document.getElementById('target');"
+                "const bump=id=>{const text=document.getElementById(id).firstChild;"
+                "text.data=String(Number(text.data)+1)};"
+                "document.getElementById('form').addEventListener('submit',"
+                "event=>{event.preventDefault();bump('submits')});");
+    html.Append(handlers);
+    html.Append("</script></body></html>");
+    resource.Complete(html.ToString());
+    ax_context_ =
+        std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
+    auto* cache =
+        To<AXObjectCacheImpl>(GetDocument().ExistingAXObjectCache());
+    ASSERT_NE(nullptr, cache);
+    cache->MarkDocumentDirty();
+    cache->UpdateAXForAllDocuments();
+    ASSERT_NE(nullptr, Button());
+  }
+
+  Element* ById(const char* id) {
+    return GetDocument().getElementById(AtomicString(id));
+  }
+  Element* Button() { return ById("target"); }
+  String TextAt(const char* id) { return ById(id)->firstChild()->nodeValue(); }
+  bool PressNativeDefault() {
+    auto* cache =
+        To<AXObjectCacheImpl>(GetDocument().ExistingAXObjectCache());
+    if (!cache || !Button())
+      return false;
+    AXObject* object = cache->Get(Button());
+    if (!object)
+      return false;
+    ui::AXActionData action;
+    action.action = ax::mojom::blink::Action::kDoDefault;
+    return object->PerformAction(action);
+  }
+  void RestoreTargetAndStatus() {
+    Button()->setAttribute(html_names::kAriaLabelAttr, AtomicString("Press"));
+    To<Text>(ById("status")->firstChild())->setData("pending");
+  }
+
+  std::unique_ptr<AXContext> ax_context_;
+};
+
+TEST_F(SelectedSemanticActionPrototypeTest, NativeButtonPositiveChangesStatus) {
+  LoadPrototype("button", "button.addEventListener('click',()=>{bump('clicks');"
+                          "document.getElementById('status').firstChild.data='complete'});");
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_EQ("complete", TextAt("status"));
+  EXPECT_FALSE(Button()->IsActive());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest, NativeButtonNoopLeavesStatusPending) {
+  LoadPrototype("button", "button.addEventListener('click',()=>bump('clicks'));");
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_EQ("pending", TextAt("status"));
+  EXPECT_FALSE(Button()->IsActive());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       FocusMutationMustStopClickAndPermitLegitimateRepeat) {
+  LoadPrototype("button", "button.addEventListener('focus',()=>{"
+                          "button.setAttribute('aria-label','Changed')},{once:true});"
+                          "button.addEventListener('click',()=>{bump('clicks');"
+                          "document.getElementById('status').firstChild.data='complete'});");
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("Changed", Button()->FastGetAttribute(html_names::kAriaLabelAttr));
+  EXPECT_EQ("0", TextAt("clicks"));
+  EXPECT_EQ("pending", TextAt("status"));
+  EXPECT_FALSE(Button()->IsActive());
+  RestoreTargetAndStatus();
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_EQ("complete", TextAt("status"));
+  EXPECT_FALSE(Button()->IsActive());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       PointerDownMutationMustStopClickAndPermitLegitimateRepeat) {
+  LoadPrototype("button", "button.addEventListener('pointerdown',()=>{"
+                          "bump('pointerdowns');button.setAttribute('aria-label',"
+                          "'Changed')},{once:true});"
+                          "button.addEventListener('click',()=>{bump('clicks');"
+                          "document.getElementById('status').firstChild.data='complete'});");
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("pointerdowns"));
+  EXPECT_EQ("Changed", Button()->FastGetAttribute(html_names::kAriaLabelAttr));
+  EXPECT_EQ("0", TextAt("clicks"));
+  EXPECT_EQ("pending", TextAt("status"));
+  EXPECT_FALSE(Button()->IsActive());
+  RestoreTargetAndStatus();
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_EQ("complete", TextAt("status"));
+  EXPECT_FALSE(Button()->IsActive());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       ClickMutationMustStopSubmitDefaultAndPermitLegitimateRepeat) {
+  LoadPrototype("submit", "button.addEventListener('click',()=>bump('clicks'));"
+                          "button.addEventListener('click',()=>{"
+                          "button.setAttribute('aria-label','Changed')},"
+                          "{once:true});");
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_EQ("Changed", Button()->FastGetAttribute(html_names::kAriaLabelAttr));
+  EXPECT_EQ("0", TextAt("submits"));
+  EXPECT_FALSE(Button()->IsActive());
+  RestoreTargetAndStatus();
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("2", TextAt("clicks"));
+  EXPECT_EQ("1", TextAt("submits"));
+  EXPECT_FALSE(Button()->IsActive());
+}
+
+// Temporary Task4b diagnostic. Observe only; a production action guard cannot
+// use a later lifecycle update as proof during synchronous event dispatch.
+struct SelectedSemanticGeometryProbeSnapshot {
+  bool saw = false;
+  bool target_connected = false;
+  bool target_parent_same = false;
+  bool label_same = false;
+  bool target_needs_layout = false;
+  bool form_needs_layout = false;
+  bool body_needs_layout = false;
+  bool root_needs_layout = false;
+  bool view_needs_layout = false;
+  bool cache_dirty = false;
+  bool body_child_needs_style_recalc = false;
+  gfx::Rect immediate_button;
+};
+
+class SelectedSemanticGeometryProbe final : public NativeEventListener {
+ public:
+  SelectedSemanticGeometryProbe(Element& button,
+                                Element& form,
+                                SelectedSemanticGeometryProbeSnapshot& snapshot)
+      : button_(&button), form_(&form), snapshot_(&snapshot) {}
+
+  void Invoke(ExecutionContext*, Event*) override {
+    Document& document = button_->GetDocument();
+    auto* cache =
+        To<AXObjectCacheImpl>(document.ExistingAXObjectCache());
+    snapshot_->saw = true;
+    snapshot_->target_connected = button_->isConnected();
+    snapshot_->target_parent_same = button_->parentElement() == form_;
+    snapshot_->label_same =
+        button_->FastGetAttribute(html_names::kAriaLabelAttr) == "Press";
+    snapshot_->target_needs_layout =
+        button_->GetLayoutObject() && button_->GetLayoutObject()->NeedsLayout();
+    snapshot_->form_needs_layout =
+        form_->GetLayoutObject() && form_->GetLayoutObject()->NeedsLayout();
+    snapshot_->body_needs_layout =
+        document.body()->GetLayoutObject() &&
+        document.body()->GetLayoutObject()->NeedsLayout();
+    snapshot_->root_needs_layout = document.GetLayoutView() &&
+                                   document.GetLayoutView()->NeedsLayout();
+    snapshot_->view_needs_layout =
+        document.View() && document.View()->NeedsLayout();
+    snapshot_->cache_dirty = cache && cache->IsDirty();
+    snapshot_->body_child_needs_style_recalc =
+        document.body()->ChildNeedsStyleRecalc();
+    if (button_->GetLayoutObject()) {
+      snapshot_->immediate_button =
+          button_->GetLayoutObject()->AbsoluteBoundingBoxRect();
+    }
+  }
+
+  void Trace(Visitor* visitor) const override {
+    visitor->Trace(button_);
+    visitor->Trace(form_);
+    NativeEventListener::Trace(visitor);
+  }
+
+ private:
+  Member<Element> button_;
+  Member<Element> form_;
+  SelectedSemanticGeometryProbeSnapshot* snapshot_;
+};
+
+class SelectedSemanticActionGeometryProbeTest
+    : public SelectedSemanticActionPrototypeTest {
+ protected:
+  void RunProbe(bool status_before, bool fixed_slot, bool multiline) {
+    StringBuilder handlers;
+    handlers.Append("const status=document.getElementById('status');"
+                    "status.style.cssText='display:block;margin:0;width:150px;"
+                    "font-size:16px;line-height:20px;white-space:pre-line;");
+    if (fixed_slot) {
+      handlers.Append("height:60px;overflow:hidden;contain:size;");
+    }
+    handlers.Append("';");
+    if (status_before) {
+      handlers.Append("document.body.insertBefore(status,"
+                      "document.getElementById('form'));");
+    }
+    handlers.Append("button.addEventListener('click',()=>{"
+                    "status.firstChild.data='");
+    handlers.Append(multiline ? "complete\\ncomplete" : "complete");
+    handlers.Append("'});");
+    LoadPrototype("button", handlers.ToString().Utf8().c_str());
+
+    Element* status = ById("status");
+    Element* form = ById("form");
+    ASSERT_NE(nullptr, status);
+    ASSERT_NE(nullptr, form);
+    ASSERT_NE(nullptr, Button()->GetLayoutObject());
+    const gfx::Rect before =
+        Button()->GetLayoutObject()->AbsoluteBoundingBoxRect();
+    SelectedSemanticGeometryProbeSnapshot snapshot;
+    auto* probe = MakeGarbageCollected<SelectedSemanticGeometryProbe>(
+        *Button(), *form, snapshot);
+    Button()->addEventListener(event_type_names::kClick, probe, false);
+    EXPECT_TRUE(PressNativeDefault());
+    Button()->removeEventListener(event_type_names::kClick, probe, false);
+    ASSERT_TRUE(snapshot.saw);
+    EXPECT_TRUE(snapshot.target_connected);
+    EXPECT_TRUE(snapshot.target_parent_same);
+    EXPECT_TRUE(snapshot.label_same);
+    EXPECT_EQ(before, snapshot.immediate_button);
+    EXPECT_FALSE(snapshot.target_needs_layout);
+    EXPECT_TRUE(snapshot.view_needs_layout);
+    EXPECT_TRUE(snapshot.cache_dirty);
+    GetDocument().UpdateStyleAndLayout(DocumentUpdateReason::kTest);
+    ASSERT_NE(nullptr, Button()->GetLayoutObject());
+    const gfx::Rect after =
+        Button()->GetLayoutObject()->AbsoluteBoundingBoxRect();
+    ASSERT_NE(nullptr, status->firstChild()->GetLayoutObject());
+    const gfx::Rect marker =
+        status->firstChild()->GetLayoutObject()->AbsoluteBoundingBoxRect();
+    EXPECT_GT(marker.width(), 0);
+    EXPECT_GT(marker.height(), 0);
+    EXPECT_TRUE(gfx::Rect(0, 0, 800, 600).Contains(marker));
+    if (fixed_slot) {
+      ASSERT_NE(nullptr, status->GetLayoutObject());
+      const gfx::Rect slot =
+          status->GetLayoutObject()->AbsoluteBoundingBoxRect();
+      EXPECT_TRUE(slot.Contains(marker));
+    }
+    if (status_before && !fixed_slot) {
+      EXPECT_GT(after.y(), before.y());
+    } else {
+      EXPECT_EQ(after.y(), before.y());
+    }
+  }
+};
+
+TEST_F(SelectedSemanticActionGeometryProbeTest, StatusBelowAcceptedShape) {
+  RunProbe(false, false, false);
+}
+
+TEST_F(SelectedSemanticActionGeometryProbeTest, StatusBeforeShiftsButton) {
+  RunProbe(true, false, true);
+}
+
+TEST_F(SelectedSemanticActionGeometryProbeTest,
+       StatusBeforeFixedSizeContainmentKeepsButton) {
+  RunProbe(true, true, true);
 }
 
 TEST_F(SelectedSemanticRequestTest,
