@@ -19,6 +19,7 @@
 #include "base/timer/timer.h"
 #include "third_party/blink/public/common/tokens/tokens.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
+#include "third_party/blink/renderer/platform/wtf/vector.h"
 
 namespace blink {
 
@@ -73,10 +74,23 @@ class LocalFrame;
 enum class SemanticRequestTerminalV1 {
   kPolicyResult, kCancelled, kDeadlineExceeded, kStaleContext, kInvalidRequest
 };
+enum class SemanticRequestKindV1 { kNode, kDocument };
+enum class SemanticObservationRoleV1 { kText, kButton };
+struct SemanticObservationEntryV1 {
+  SemanticObservationRoleV1 role;
+  String text;
+};
+struct SemanticObservationV1 {
+  SemanticDispositionV1 disposition = SemanticDispositionV1::kNotReady;
+  Vector<SemanticObservationEntryV1> entries;
+  unsigned reserved_output_bytes = 0;
+};
 struct SemanticRequestResultV1 {
   SemanticRequestTerminalV1 terminal = SemanticRequestTerminalV1::kInvalidRequest;
+  SemanticRequestKindV1 kind = SemanticRequestKindV1::kNode;
   uint64_t epoch = 0;
   SemanticNodeResultV1 node;
+  SemanticObservationV1 observation;
   SemanticBudgetV1 budget;
   SemanticAuditV1 audit;
 };
@@ -93,6 +107,10 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
       Document&, AXObjectCacheImpl&, Node&, uint64_t epoch,
       base::TimeTicks deadline,
       scoped_refptr<base::SingleThreadTaskRunner>, Completion);
+  static std::unique_ptr<SelectedSemanticRequestV1> CreateDocument(
+      Document&, AXObjectCacheImpl&, uint64_t epoch,
+      base::TimeTicks deadline,
+      scoped_refptr<base::SingleThreadTaskRunner>, Completion);
   ~SelectedSemanticRequestV1();
   SelectedSemanticRequestV1(const SelectedSemanticRequestV1&) = delete;
   SelectedSemanticRequestV1& operator=(const SelectedSemanticRequestV1&) = delete;
@@ -104,7 +122,8 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   SelectedSemanticRequestV1(Document&, AXObjectCacheImpl&, Node&, uint64_t,
                             base::TimeTicks,
                             scoped_refptr<base::SingleThreadTaskRunner>, Completion,
-                            const base::TickClock*);
+                            const base::TickClock*,
+                            SemanticRequestKindV1 = SemanticRequestKindV1::kNode);
   void Start();
   void OnAXReady();
   void OnDeadline();
@@ -119,6 +138,7 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   std::optional<LocalFrameToken> frame_token_;
   const base::TickClock* const clock_;
   const uint64_t epoch_;
+  const SemanticRequestKindV1 kind_;
   const base::TimeTicks deadline_;
   scoped_refptr<base::SingleThreadTaskRunner> task_runner_;
   Completion completion_;

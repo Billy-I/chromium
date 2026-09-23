@@ -11,6 +11,7 @@
 #include <memory>
 #include <limits>
 #include <optional>
+#include <set>
 
 #include "testing/gtest/include/gtest/gtest.h"
 #include "third_party/blink/renderer/bindings/core/v8/v8_binding_for_core.h"
@@ -191,6 +192,14 @@ struct SemanticAXCacheStateTestAccess : AXObject {
     (object.*setter)(dirty, dirty
         ? std::optional<TreeUpdateReason>(TreeUpdateReason::kMarkAXObjectDirty)
         : std::nullopt);
+  }
+  static Member<AXObject>& Parent(AXObject& object) {
+    auto field = &SemanticAXCacheStateTestAccess::parent_;
+    return object.*field;
+  }
+  static AXObjectVector& Children(AXObject& object) {
+    auto field = &SemanticAXCacheStateTestAccess::children_;
+    return object.*field;
   }
 };
 
@@ -2131,17 +2140,21 @@ class SelectedSemanticRequestTestPeer {
  public:
   static void Ready(SelectedSemanticRequestV1& request) { request.OnAXReady(); }
   static void Deadline(SelectedSemanticRequestV1& request) { request.OnDeadline(); }
+  static bool Pending(const SelectedSemanticRequestV1& request) {
+    return !request.terminal_;
+  }
   static std::unique_ptr<SelectedSemanticRequestV1> CreateWithClock(
       Document& document, AXObjectCacheImpl& cache, Node& node, uint64_t epoch,
       base::TimeTicks deadline,
       scoped_refptr<base::SingleThreadTaskRunner> runner,
       SelectedSemanticRequestV1::Completion completion,
-      const base::TickClock& clock) {
+      const base::TickClock& clock,
+      SemanticRequestKindV1 kind = SemanticRequestKindV1::kNode) {
     CHECK(IsMainThread());
     auto request = std::unique_ptr<SelectedSemanticRequestV1>(
         new SelectedSemanticRequestV1(document, cache, node, epoch, deadline,
                                       std::move(runner), std::move(completion),
-                                      &clock));
+                                      &clock, kind));
     request->Start();
     return request;
   }
@@ -2182,6 +2195,19 @@ class SelectedSemanticRequestTest : public RenderingTest {
           results->push_back(std::move(result));
         }, cache_, std::move(results)));
   }
+  std::unique_ptr<SelectedSemanticRequestV1> RequestDocument(
+      std::shared_ptr<Results> results, uint64_t epoch = 7,
+      base::TimeDelta duration = base::Seconds(1)) {
+    return SelectedSemanticRequestV1::CreateDocument(
+        GetDocument(), *cache_, epoch, base::TimeTicks::Now() + duration,
+        task_environment().GetMainThreadTaskRunner(),
+        blink::BindOnce([](WeakPersistent<AXObjectCacheImpl> cache,
+                           std::shared_ptr<Results> results,
+                           SemanticRequestResultV1 result) {
+          EXPECT_FALSE(cache && cache->IsFrozen());
+          results->push_back(std::move(result));
+        }, cache_, std::move(results)));
+  }
   void DriveAX() {
     // Ambient test driver, not a request implementation preparation call.
     cache_->MarkDocumentDirty();
@@ -2216,6 +2242,773 @@ TEST_F(SelectedSemanticRequestTest, RealReadyCallbackPostsImmutableResultAfterFr
   EXPECT_EQ("Allowed", result.node.text);
   EXPECT_EQ(1u, result.audit.text_reads);
   EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentLateMalformedLabelClearsEarlierText) {
+  SetReadyBody("<p>Allowed first</p><button id=target></button>");
+  StringBuilder label;
+  label.Append("Bad prefix");
+  label.Append(UChar(0xd800));
+  GetElementById("target")->setAttribute(html_names::kAriaLabelAttr,
+                                         label.ToAtomicString());
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, result.kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(SemanticDispositionV1::kUnsupportedText,
+            result.observation.disposition);
+  EXPECT_TRUE(result.observation.entries.empty());
+  EXPECT_EQ(2u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentCancelClearsEntireResultOnce) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  request->Cancel();
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, results->front().kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kCancelled, results->front().terminal);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  EXPECT_EQ(SemanticDispositionV1::kNotReady,
+            results->front().observation.disposition);
+  EXPECT_TRUE(results->front().node.text.empty());
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentMissingReadyExpiresUnreadOnce) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  task_environment().FastForwardBy(base::Milliseconds(999));
+  EXPECT_TRUE(results->empty());
+  task_environment().FastForwardBy(base::Milliseconds(1));
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, result.kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kDeadlineExceeded, result.terminal);
+  EXPECT_TRUE(result.observation.entries.empty());
+  EXPECT_EQ(0u, result.audit.text_reads);
+  DriveAX();
+  Deliver();
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentDestroyPendingIsUnreadOnce) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  request.reset();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, results->front().kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kCancelled, results->front().terminal);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  EXPECT_EQ(0u, results->front().audit.text_reads);
+  DriveAX();
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentEpochMismatchAndLateReadyAreUnread) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  request->InvalidateEpoch(8);
+  DriveAX();
+  SelectedSemanticRequestTestPeer::Ready(*request);
+  SelectedSemanticRequestTestPeer::Deadline(*request);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, results->front().kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kStaleContext, results->front().terminal);
+  EXPECT_EQ(7u, results->front().epoch);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  EXPECT_EQ(0u, results->front().audit.text_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentDuplicateReadyCannotCompleteTwice) {
+  SetReadyBody();
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  SelectedSemanticRequestTestPeer::Ready(*request);
+  SelectedSemanticRequestTestPeer::Deadline(*request);
+  request->Cancel();
+  request->InvalidateEpoch(8);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, results->front().kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, results->front().terminal);
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            results->front().observation.disposition);
+  ASSERT_EQ(1u, results->front().observation.entries.size());
+  EXPECT_EQ("Allowed", results->front().observation.entries[0].text);
+  request.reset();
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentCachedGraphFaultsClearPriorText) {
+  enum class Fault {
+    kCompetingParent, kDuplicateChild, kLateDirtyChild, kWrongLayout
+  };
+  for (Fault fault : {Fault::kCompetingParent, Fault::kDuplicateChild,
+                      Fault::kLateDirtyChild, Fault::kWrongLayout}) {
+    SCOPED_TRACE(static_cast<unsigned>(fault));
+    SetReadyBody("<p id=first>Allowed first</p><p id=second>Allowed second</p>");
+    Node* first = GetElementById("first")->firstChild();
+    Node* second = GetElementById("second")->firstChild();
+    ASSERT_TRUE(first && second);
+    struct Probe {
+      std::unique_ptr<SelectedSemanticRequestV1> request;
+      bool ran = false;
+    };
+    auto probe = std::make_shared<Probe>();
+    cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+        [](WeakPersistent<AXObjectCacheImpl> cache,
+           WeakPersistent<Node> first, WeakPersistent<Node> second,
+           Fault fault, std::shared_ptr<Probe> probe) {
+          ASSERT_TRUE(cache && first && second);
+          ASSERT_TRUE(cache->IsFrozen());
+          ASSERT_TRUE(probe->request);
+          AXObject* first_ax = cache->Get(first.Get());
+          AXObject* second_ax = cache->Get(second.Get());
+          ASSERT_TRUE(first_ax && second_ax);
+          AXObject* first_parent = first_ax->ParentObjectIfPresent();
+          AXObject* second_parent = second_ax->ParentObjectIfPresent();
+          ASSERT_TRUE(first_parent && second_parent);
+          ASSERT_NE(first_parent, second_parent);
+          ASSERT_TRUE(first_parent->IsIncludedInTree());
+          ASSERT_TRUE(second_parent->IsIncludedInTree());
+          ASSERT_FALSE(second_ax->NeedsToUpdateCachedValues());
+          probe->ran = true;
+          if (fault == Fault::kCompetingParent) {
+            Member<AXObject> original = SemanticAXCacheStateTestAccess::Parent(*second_ax);
+            SemanticAXCacheStateTestAccess::Parent(*second_ax) = first_parent;
+            SelectedSemanticRequestTestPeer::Ready(*probe->request);
+            SemanticAXCacheStateTestAccess::Parent(*second_ax) = original;
+          } else if (fault == Fault::kDuplicateChild) {
+            auto& children = SemanticAXCacheStateTestAccess::Children(*second_parent);
+            const auto original_size = children.size();
+            bool found = false;
+            for (const auto& member : children) found |= member.Get() == second_ax;
+            ASSERT_TRUE(found);
+            children.push_back(second_ax);
+            SelectedSemanticRequestTestPeer::Ready(*probe->request);
+            children.pop_back();
+            EXPECT_EQ(original_size, children.size());
+          } else if (fault == Fault::kLateDirtyChild) {
+            SemanticAXCacheStateTestAccess::SetDirty(*second_ax, true);
+            SelectedSemanticRequestTestPeer::Ready(*probe->request);
+            SemanticAXCacheStateTestAccess::SetDirty(*second_ax, false);
+          } else {
+            LayoutObject* first_layout = first->GetLayoutObject();
+            LayoutObject* second_layout = second->GetLayoutObject();
+            ASSERT_TRUE(first_layout && second_layout);
+            ASSERT_EQ(second_layout, second_ax->GetLayoutObject());
+            second->SetLayoutObject(first_layout);
+            SelectedSemanticRequestTestPeer::Ready(*probe->request);
+            second->SetLayoutObject(second_layout);
+          }
+        }, cache_, WrapWeakPersistent(first), WrapWeakPersistent(second),
+        fault, probe));
+    auto results = std::make_shared<Results>();
+    probe->request = RequestDocument(results);
+    DriveAX();
+    ASSERT_TRUE(probe->ran);
+    Deliver();
+    ASSERT_EQ(1u, results->size());
+    const auto& result = results->front();
+    EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+    EXPECT_EQ(fault == Fault::kCompetingParent
+                  ? SemanticDispositionV1::kStaleDocument
+                  : fault == Fault::kDuplicateChild
+                        ? SemanticDispositionV1::kLimitExceeded
+                        : SemanticDispositionV1::kNotReady,
+              result.observation.disposition);
+    EXPECT_TRUE(result.observation.entries.empty());
+    EXPECT_EQ(fault == Fault::kDuplicateChild ? 2u : 1u,
+              result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+  }
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentFlattenedParentAndCycle) {
+  for (bool cycle : {false, true}) {
+    SCOPED_TRACE(cycle);
+    SetReadyBody("<p>Allowed first</p><p><span id=wrapper role=presentation>"
+                 "<span id=second>Allowed second</span></span></p>");
+    Element* wrapper = GetElementById("wrapper");
+    Node* second = GetElementById("second")->firstChild();
+    ASSERT_TRUE(wrapper && second);
+    struct Probe {
+      std::unique_ptr<SelectedSemanticRequestV1> request;
+      bool ran = false;
+    };
+    auto probe = std::make_shared<Probe>();
+    cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+        [](WeakPersistent<AXObjectCacheImpl> cache,
+           WeakPersistent<Element> wrapper, WeakPersistent<Node> second,
+           bool cycle, std::shared_ptr<Probe> probe) {
+          ASSERT_TRUE(cache && wrapper && second && cache->IsFrozen());
+          ASSERT_TRUE(probe->request);
+          AXObject* ignored = cache->Get(wrapper.Get());
+          AXObject* text = cache->Get(second.Get());
+          ASSERT_TRUE(ignored && text);
+          ASSERT_FALSE(ignored->IsIncludedInTree());
+          ASSERT_FALSE(ignored->IsDetached());
+          ASSERT_FALSE(ignored->NeedsToUpdateCachedValues());
+          bool in_cached_chain = false;
+          unsigned count = 0;
+          for (const AXObject* parent = text->ParentObjectIfPresent();
+               parent && count++ < 16;
+               parent = parent->ParentObjectIfPresent()) {
+            in_cached_chain |= parent == ignored;
+          }
+          ASSERT_TRUE(in_cached_chain);
+          if (cycle) {
+            Member<AXObject> original =
+                SemanticAXCacheStateTestAccess::Parent(*ignored);
+            SemanticAXCacheStateTestAccess::Parent(*ignored) = ignored;
+            SelectedSemanticRequestTestPeer::Ready(*probe->request);
+            SemanticAXCacheStateTestAccess::Parent(*ignored) = original;
+          } else {
+            SelectedSemanticRequestTestPeer::Ready(*probe->request);
+          }
+          probe->ran = true;
+        }, cache_, WrapWeakPersistent(wrapper), WrapWeakPersistent(second),
+        cycle, probe));
+    auto results = std::make_shared<Results>();
+    probe->request = RequestDocument(results);
+    DriveAX();
+    ASSERT_TRUE(probe->ran);
+    Deliver();
+    ASSERT_EQ(1u, results->size());
+    const auto& result = results->front();
+    EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+    EXPECT_EQ(cycle ? SemanticDispositionV1::kStaleDocument
+                    : SemanticDispositionV1::kAdmitted,
+              result.observation.disposition);
+    EXPECT_EQ(cycle ? 0u : 2u, result.observation.entries.size());
+    EXPECT_EQ(cycle ? 1u : 2u, result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+  }
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentAbsentWhitespaceSkips) {
+  SetReadyBody("<p>Allowed first</p>\n<p>Allowed second</p>");
+  Node* gap = GetDocument().body()->firstChild()->nextSibling();
+  ASSERT_TRUE(gap && gap->IsTextNode());
+  struct Probe {
+    std::unique_ptr<SelectedSemanticRequestV1> request;
+    bool ran = false;
+    bool cached = false;
+    bool own_layout_null = false;
+    bool ax_layout_null = false;
+  };
+  auto probe = std::make_shared<Probe>();
+  cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+      [](WeakPersistent<AXObjectCacheImpl> cache,
+         WeakPersistent<Node> gap, std::shared_ptr<Probe> probe) {
+        ASSERT_TRUE(cache && gap && cache->IsFrozen());
+        ASSERT_TRUE(probe->request);
+        AXObject* object = cache->Get(gap.Get());
+        probe->cached = object != nullptr;
+        probe->own_layout_null = !gap->GetLayoutObject();
+        probe->ax_layout_null = object && !object->GetLayoutObject();
+        SelectedSemanticRequestTestPeer::Ready(*probe->request);
+        probe->ran = true;
+      }, cache_, WrapWeakPersistent(gap), probe));
+  auto results = std::make_shared<Results>();
+  probe->request = RequestDocument(results);
+  DriveAX();
+  ASSERT_TRUE(probe->ran);
+  // Blink did not cache this unrendered newline at all. This witnesses AX
+  // absence, not the separate both-null cached-object policy branch.
+  EXPECT_FALSE(probe->cached);
+  EXPECT_TRUE(probe->own_layout_null);
+  EXPECT_FALSE(probe->ax_layout_null);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(2u, result.observation.entries.size());
+  EXPECT_EQ("Allowed first", result.observation.entries[0].text);
+  EXPECT_EQ("Allowed second", result.observation.entries[1].text);
+  EXPECT_EQ(2u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentSourceLessListMarkerSkips) {
+  SetReadyBody("<p id=marked style='display:list-item'>Allowed first</p>"
+               "<p>Allowed second</p>");
+  Element* marked = GetElementById("marked");
+  ASSERT_NE(nullptr, marked);
+  struct Probe {
+    std::unique_ptr<SelectedSemanticRequestV1> request;
+    bool ran = false;
+    unsigned source_less = 0;
+  };
+  auto probe = std::make_shared<Probe>();
+  cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+      [](WeakPersistent<AXObjectCacheImpl> cache,
+         WeakPersistent<Element> marked, std::shared_ptr<Probe> probe) {
+        ASSERT_TRUE(cache && marked && cache->IsFrozen());
+        ASSERT_TRUE(probe->request);
+        const AXObject* marked_ax = cache->Get(marked.Get());
+        ASSERT_NE(nullptr, marked_ax);
+        std::vector<const AXObject*> stack{marked_ax};
+        while (!stack.empty()) {
+          ASSERT_LE(stack.size(), 256u);
+          const AXObject* current = stack.back();
+          stack.pop_back();
+          if (!current->GetNode()) ++probe->source_less;
+          for (const auto& member : current->ChildrenIncludingIgnored()) {
+            ASSERT_NE(nullptr, member.Get());
+            stack.push_back(member.Get());
+          }
+        }
+        SelectedSemanticRequestTestPeer::Ready(*probe->request);
+        probe->ran = true;
+      }, cache_, WrapWeakPersistent(marked), probe));
+  auto results = std::make_shared<Results>();
+  probe->request = RequestDocument(results);
+  DriveAX();
+  ASSERT_TRUE(probe->ran);
+  EXPECT_GE(probe->source_less, 1u);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(2u, result.observation.entries.size());
+  EXPECT_EQ("Allowed first", result.observation.entries[0].text);
+  EXPECT_EQ("Allowed second", result.observation.entries[1].text);
+  EXPECT_EQ(2u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentExcessiveFanoutRejectsWithoutPartialText) {
+  StringBuilder html;
+  html.Append("<p>Allowed first</p>");
+  for (unsigned i = 0; i < 260; ++i)
+    html.Append("<button aria-label=Allowed></button>");
+  SetReadyBody(html.ToString());
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult,
+            results->front().terminal);
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded,
+            results->front().observation.disposition);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  // The cached body child vector is rejected before the 257th traversal; this
+  // is the independent per-parent fanout guard, not a distinct-source proof.
+  EXPECT_EQ(3u, results->front().budget.nodes);
+  EXPECT_LT(results->front().budget.fragments, 512u);
+  EXPECT_LT(results->front().budget.relation_steps, 4096u);
+  EXPECT_EQ(0u, results->front().audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentDistinctCachedSourcesReachLimit) {
+  StringBuilder html;
+  html.Append("<p>Allowed first</p>");
+  for (unsigned i = 0; i < 255; ++i)
+    html.Append("<div role=group></div>");
+  SetReadyBody(html.ToString());
+  ASSERT_EQ(256u, GetDocument().body()->CountChildren());
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(256u, result.budget.nodes);
+  EXPECT_LT(result.budget.relation_steps, 4096u);
+  EXPECT_LT(result.budget.fragments, 512u);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded,
+            result.observation.disposition);
+  EXPECT_TRUE(result.observation.entries.empty());
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentAcceptsExactDistinctSourceLimit) {
+  StringBuilder html;
+  html.Append("<p>Allowed first</p>");
+  for (unsigned i = 0; i < 251; ++i)
+    html.Append("<div role=group></div>");
+  SetReadyBody(html.ToString());
+  ASSERT_EQ(252u, GetDocument().body()->CountChildren());
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(256u, result.budget.nodes);
+  EXPECT_LT(result.budget.relation_steps, 4096u);
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(1u, result.observation.entries.size());
+  EXPECT_EQ("Allowed first", result.observation.entries[0].text);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentDeepTreeWorkRejectsFirst) {
+  StringBuilder html;
+  for (unsigned i = 0; i < 65; ++i) html.Append("<div role=group>");
+  html.Append("<button aria-label=Allowed></button>");
+  for (unsigned i = 0; i < 65; ++i) html.Append("</div>");
+  SetReadyBody(html.ToString());
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded,
+            results->front().observation.disposition);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  EXPECT_LT(results->front().budget.depth, 64u);
+  EXPECT_LT(results->front().budget.nodes, 256u);
+  EXPECT_EQ(4096u, results->front().budget.relation_steps);
+  EXPECT_EQ(0u, results->front().audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentSharedRelationWorkRejects) {
+  StringBuilder html;
+  html.Append("<p>Allowed first</p>");
+  for (unsigned depth = 0; depth < 16; ++depth) {
+    html.Append("<div role=group");
+    for (unsigned attribute = 0; attribute < 80; ++attribute) {
+      html.Append(" data-k");
+      html.AppendNumber(attribute);
+      html.Append("=x");
+    }
+    html.Append(">");
+  }
+  html.Append("<button aria-label=Allowed></button>");
+  for (unsigned depth = 0; depth < 16; ++depth) html.Append("</div>");
+  SetReadyBody(html.ToString());
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded,
+            results->front().observation.disposition);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  EXPECT_LE(results->front().budget.relation_steps, 4096u);
+  EXPECT_GT(80u, 4096u - results->front().budget.relation_steps);
+  EXPECT_LT(results->front().budget.nodes, 256u);
+  EXPECT_LT(results->front().budget.fragments, 512u);
+  EXPECT_GE(results->front().audit.text_reads, 1u);
+  EXPECT_EQ(0u, results->front().audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentAggregatesFragmentBudget) {
+  for (unsigned second_count : {24u, 25u}) {
+    SCOPED_TRACE(second_count);
+    StringBuilder html;
+    html.Append("<p id=first style='white-space:pre'>");
+    for (unsigned i = 0; i < 24; ++i)
+      html.Append(static_cast<UChar>((i & 1) ? 0x05D0 : 'A'));
+    html.Append("</p><p id=second style='white-space:pre'>");
+    for (unsigned i = 0; i < second_count; ++i)
+      html.Append(static_cast<UChar>((i & 1) ? 0x05D0 : 'A'));
+    html.Append("</p>");
+    SetReadyBody(html.ToString());
+    auto* first = DynamicTo<LayoutText>(
+        GetElementById("first")->firstChild()->GetLayoutObject());
+    auto* second = DynamicTo<LayoutText>(
+        GetElementById("second")->firstChild()->GetLayoutObject());
+    ASSERT_TRUE(first && second);
+    ASSERT_TRUE(first->HasValidInlineItems());
+    ASSERT_TRUE(second->HasValidInlineItems());
+    ASSERT_EQ(24u, first->InlineItems().size());
+    ASSERT_EQ(second_count, second->InlineItems().size());
+    auto results = std::make_shared<Results>();
+    auto request = RequestDocument(results);
+    DriveAX();
+    Deliver();
+    ASSERT_EQ(1u, results->size());
+    const auto& result = results->front();
+    EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+    EXPECT_EQ(24u + second_count, result.budget.fragments);
+    EXPECT_LT(result.budget.relation_steps, 4096u);
+    EXPECT_LT(result.budget.nodes, 256u);
+    EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+              result.observation.disposition);
+    ASSERT_EQ(2u, result.observation.entries.size());
+    EXPECT_EQ(2u, result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+  }
+}
+
+TEST_F(SelectedSemanticRequestTest, OwnFragmentCounterAccepts512AndRejects513) {
+  SetReadyBody("<p id=target>Allowed</p>");
+  Node* target = Target();
+  auto* layout = DynamicTo<LayoutText>(target->GetLayoutObject());
+  ASSERT_NE(nullptr, layout);
+  ASSERT_EQ(1u, layout->InlineItems().size());
+  struct Probe {
+    bool ran = false;
+    SemanticDispositionV1 exact = SemanticDispositionV1::kNotReady;
+    SemanticDispositionV1 over = SemanticDispositionV1::kNotReady;
+    SemanticBudgetV1 exact_budget;
+    SemanticBudgetV1 over_budget;
+  };
+  auto probe = std::make_shared<Probe>();
+  cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+      [](WeakPersistent<AXObjectCacheImpl> cache, WeakPersistent<Node> target,
+         std::shared_ptr<Probe> probe) {
+        ASSERT_TRUE(cache && target && cache->IsFrozen());
+        ScriptForbiddenScope forbid_script;
+        AXObject* object = cache->Get(target.Get());
+        ASSERT_NE(nullptr, object);
+        probe->exact_budget.fragments = 511;
+        probe->over_budget.fragments = 512;
+        probe->exact = ClassifyOwnGeometryV1(*object, probe->exact_budget);
+        probe->over = ClassifyOwnGeometryV1(*object, probe->over_budget);
+        probe->ran = true;
+      }, cache_, WrapWeakPersistent(target), probe));
+  DriveAX();
+  ASSERT_TRUE(probe->ran);
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted, probe->exact);
+  EXPECT_EQ(512u, probe->exact_budget.fragments);
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded, probe->over);
+  EXPECT_EQ(512u, probe->over_budget.fragments);
+}
+
+TEST_F(SelectedSemanticRequestTest, StructureDepthAccepts64AndRejects65) {
+  for (unsigned wrappers : {59u, 60u}) {
+    SCOPED_TRACE(wrappers);
+    StringBuilder html;
+    for (unsigned i = 0; i < wrappers; ++i) html.Append("<div>");
+    html.Append("<p id=target>Allowed</p>");
+    for (unsigned i = 0; i < wrappers; ++i) html.Append("</div>");
+    SetReadyBody(html.ToString());
+    Node* target = Target();
+    struct Probe {
+      bool ran = false;
+      SemanticDispositionV1 disposition = SemanticDispositionV1::kNotReady;
+      SemanticBudgetV1 budget;
+      SemanticAuditV1 audit;
+    };
+    auto probe = std::make_shared<Probe>();
+    cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+        [](WeakPersistent<AXObjectCacheImpl> cache, WeakPersistent<Node> target,
+           std::shared_ptr<Probe> probe) {
+          ASSERT_TRUE(cache && target && cache->IsFrozen());
+          ScriptForbiddenScope forbid_script;
+          probe->disposition = ClassifySelectedStructureV1(
+              *target, *cache, probe->budget, probe->audit);
+          probe->ran = true;
+        }, cache_, WrapWeakPersistent(target), probe));
+    DriveAX();
+    ASSERT_TRUE(probe->ran);
+    EXPECT_EQ(64u, probe->budget.depth);
+    EXPECT_LT(probe->budget.nodes, 256u);
+    EXPECT_LT(probe->budget.relation_steps, 4096u);
+    EXPECT_EQ(wrappers == 59 ? SemanticDispositionV1::kAdmitted
+                             : SemanticDispositionV1::kLimitExceeded,
+              probe->disposition);
+    EXPECT_EQ(0u, probe->audit.text_reads);
+    EXPECT_EQ(0u, probe->audit.forbidden_reads);
+  }
+}
+
+TEST_F(SelectedSemanticRequestTest, RelationshipCounterAccepts4096AndRejects4097) {
+  SetReadyBody();
+  struct Probe {
+    bool ran = false;
+    SemanticDispositionV1 exact = SemanticDispositionV1::kNotReady;
+    SemanticDispositionV1 over = SemanticDispositionV1::kNotReady;
+    SemanticBudgetV1 exact_budget;
+    SemanticBudgetV1 over_budget;
+  };
+  auto probe = std::make_shared<Probe>();
+  cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+      [](WeakPersistent<AXObjectCacheImpl> cache,
+         WeakPersistent<Document> document, std::shared_ptr<Probe> probe) {
+        ASSERT_TRUE(cache && document && cache->IsFrozen());
+        ScriptForbiddenScope forbid_script;
+        SemanticAuditV1 audit;
+        probe->exact_budget.relation_steps = 4095;
+        probe->over_budget.relation_steps = 4096;
+        probe->exact = ClassifySelectedStructureV1(
+            *document, *cache, probe->exact_budget, audit);
+        probe->over = ClassifySelectedStructureV1(
+            *document, *cache, probe->over_budget, audit);
+        EXPECT_EQ(0u, audit.text_reads);
+        EXPECT_EQ(0u, audit.forbidden_reads);
+        probe->ran = true;
+      }, cache_, WrapWeakPersistent(&GetDocument()), probe));
+  DriveAX();
+  ASSERT_TRUE(probe->ran);
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted, probe->exact);
+  EXPECT_EQ(4096u, probe->exact_budget.relation_steps);
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded, probe->over);
+  EXPECT_EQ(4096u, probe->over_budget.relation_steps);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentLateLongLabelClearsEarlierText) {
+  SetReadyBody("<p>Allowed first</p><button id=target></button>");
+  GetElementById("target")->setAttribute(html_names::kAriaLabelAttr,
+      AtomicString(String::FromUtf8(std::string(4097, 'x'))));
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  EXPECT_EQ(SemanticDispositionV1::kLimitExceeded,
+            results->front().observation.disposition);
+  EXPECT_TRUE(results->front().observation.entries.empty());
+  EXPECT_EQ(2u, results->front().audit.text_reads);
+  EXPECT_EQ(0u, results->front().audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentPrunesEditableAndHiddenText) {
+  SetReadyBody(
+      "<p>Allowed first</p>"
+      "<div contenteditable=true><p>Editable canary</p></div>"
+      "<div aria-hidden=true><p>Hidden canary</p></div>"
+      "<p>Allowed second</p>");
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(2u, result.observation.entries.size());
+  EXPECT_EQ("Allowed first", result.observation.entries[0].text);
+  EXPECT_EQ("Allowed second", result.observation.entries[1].text);
+  EXPECT_EQ(2u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentTraversesZeroSizeContainer) {
+  SetReadyBody(
+      "<div style='width:0;height:0;overflow:visible'>"
+      "<p style='width:150px;height:20px'>Allowed visible child</p></div>");
+  auto* container = GetDocument().body()->firstElementChild();
+  ASSERT_NE(nullptr, container);
+  auto* box = DynamicTo<LayoutBox>(container->GetLayoutObject());
+  ASSERT_NE(nullptr, box);
+  const auto* fragment = box->GetPhysicalFragment(0);
+  ASSERT_NE(nullptr, fragment);
+  ASSERT_EQ(LayoutUnit(), fragment->Size().width);
+  ASSERT_EQ(LayoutUnit(), fragment->Size().height);
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(1u, result.observation.entries.size());
+  EXPECT_EQ("Allowed visible child", result.observation.entries[0].text);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentExcludesOwnZeroAndOffscreenLeaves) {
+  SetReadyBody(
+      "<p>Allowed first</p>"
+      "<button aria-label='Zero canary' style='appearance:none;width:0;"
+      "height:20px;padding:0;border:0;overflow:visible'></button>"
+      "<button aria-label='Offscreen canary' style='position:relative;"
+      "left:900px;width:40px;height:20px'></button>"
+      "<p>Allowed second</p>");
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(2u, result.observation.entries.size());
+  EXPECT_EQ("Allowed first", result.observation.entries[0].text);
+  EXPECT_EQ("Allowed second", result.observation.entries[1].text);
+  EXPECT_EQ(2u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentEmptyDirectLabelIsLocalSkip) {
+  SetReadyBody("<p>Allowed first</p>"
+               "<button aria-label='' style='width:60px;height:20px'></button>"
+               "<p>Allowed second</p>");
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(2u, result.observation.entries.size());
+  EXPECT_EQ("Allowed first", result.observation.entries[0].text);
+  EXPECT_EQ("Allowed second", result.observation.entries[1].text);
+  EXPECT_EQ(3u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WholeDocumentOutputReservationExactAndOver) {
+  StringBuilder html;
+  for (unsigned i = 0; i < 16; ++i)
+    html.Append("<button style='appearance:none;width:60px;height:20px'>"
+                "</button>");
+  for (unsigned last_length : {2816u, 2817u}) {
+    SetReadyBody(html.ToString());
+    auto* button = GetDocument().body()->firstElementChild();
+    for (unsigned i = 0; i < 16; ++i) {
+      ASSERT_NE(nullptr, button);
+      const unsigned length = i == 15 ? last_length : 4096;
+      button->setAttribute(html_names::kAriaLabelAttr,
+          AtomicString(String::FromUtf8(std::string(length, 'x'))));
+      button = button->nextElementSibling();
+    }
+    ASSERT_EQ(nullptr, button);
+    auto results = std::make_shared<Results>();
+    auto request = RequestDocument(results);
+    DriveAX();
+    Deliver();
+    ASSERT_EQ(1u, results->size());
+    const auto& result = results->front();
+    if (last_length == 2816) {
+      EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+                result.observation.disposition);
+      EXPECT_EQ(16u, result.observation.entries.size());
+      EXPECT_EQ(65536u, result.observation.reserved_output_bytes);
+      EXPECT_EQ(64256u, result.budget.utf8_bytes);
+    } else {
+      EXPECT_EQ(SemanticDispositionV1::kLimitExceeded,
+                result.observation.disposition);
+      EXPECT_TRUE(result.observation.entries.empty());
+      EXPECT_EQ(0u, result.observation.reserved_output_bytes);
+    }
+    EXPECT_EQ(16u, result.audit.text_reads);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+  }
 }
 
 TEST_F(SelectedSemanticRequestTest, OwnZeroAndOffscreenRequestsStayUnread) {
@@ -2498,6 +3291,59 @@ TEST_F(SelectedSemanticRequestTest, PostReadDeadlineDropsTextButPreservesAudit) 
   EXPECT_EQ(2u, probe->clock->ReadsAfterArm());
 }
 
+TEST_F(SelectedSemanticRequestTest, WholeDocumentPostReadExpiryClearsEntries) {
+  SetReadyBody("<p>Allowed first</p><p>Allowed second</p>");
+  auto results = std::make_shared<Results>();
+  const auto before = base::TimeTicks::Now();
+  const auto deadline = before + base::Seconds(1);
+  struct Probe {
+    std::shared_ptr<SelectedSemanticRequestSteppingClock> clock;
+    std::unique_ptr<SelectedSemanticRequestV1> request;
+    bool ready_ran = false;
+  };
+  auto probe = std::make_shared<Probe>();
+  probe->clock = std::make_shared<SelectedSemanticRequestSteppingClock>(
+      before, deadline);
+  cache_->ScheduleAXUpdateWithCallback(blink::BindOnce(
+      [](WeakPersistent<AXObjectCacheImpl> cache, std::shared_ptr<Probe> probe) {
+        ASSERT_TRUE(cache && cache->IsFrozen());
+        ASSERT_TRUE(probe->request);
+        probe->ready_ran = true;
+        probe->clock->Arm();
+        SelectedSemanticRequestTestPeer::Ready(*probe->request);
+        EXPECT_EQ(2u, probe->clock->ReadsAfterArm());
+      }, cache_, probe));
+  probe->request = SelectedSemanticRequestTestPeer::CreateWithClock(
+      GetDocument(), *cache_, GetDocument(), 7, deadline,
+      task_environment().GetMainThreadTaskRunner(),
+      blink::BindOnce(
+          [](WeakPersistent<AXObjectCacheImpl> cache,
+             std::shared_ptr<Results> results, SemanticRequestResultV1 result) {
+            EXPECT_FALSE(cache && cache->IsFrozen());
+            results->push_back(std::move(result));
+          }, cache_, results),
+      *probe->clock, SemanticRequestKindV1::kDocument);
+  DriveAX();
+  ASSERT_TRUE(probe->ready_ran);
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, result.kind);
+  EXPECT_EQ(SemanticRequestTerminalV1::kDeadlineExceeded, result.terminal);
+  EXPECT_EQ(SemanticDispositionV1::kNotReady,
+            result.observation.disposition);
+  EXPECT_TRUE(result.observation.entries.empty());
+  EXPECT_EQ(0u, result.observation.reserved_output_bytes);
+  EXPECT_EQ(2u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  EXPECT_EQ(27u, result.budget.utf8_bytes);
+  SelectedSemanticRequestTestPeer::Ready(*probe->request);
+  SelectedSemanticRequestTestPeer::Deadline(*probe->request);
+  probe->request.reset();
+  task_environment().FastForwardBy(base::Seconds(2));
+  EXPECT_EQ(1u, results->size());
+}
+
 
 namespace {
 // action.html SHA256 da2b79e69a9f165533125a5f046ca28bc3b1de680f7d35a1d143e9c94a60c473
@@ -2754,6 +3600,23 @@ class SelectedSemanticRun12FixtureTest : public SimTest {
     return pending;
   }
 
+  Pending QueueDocument(AXObjectCacheImpl& cache) {
+    Pending pending;
+    pending.slot = std::make_shared<Slot>();
+    pending.request = SelectedSemanticRequestV1::CreateDocument(
+        cache.GetDocument(), cache, 12,
+        base::TimeTicks::Now() + base::Seconds(5),
+        task_environment().GetMainThreadTaskRunner(),
+        blink::BindOnce(
+            [](WeakPersistent<AXObjectCacheImpl> weak_cache,
+               std::shared_ptr<Slot> slot, SemanticRequestResultV1 result) {
+              EXPECT_FALSE(weak_cache && weak_cache->IsFrozen());
+              slot->results.push_back(std::move(result));
+            }, WeakPersistent<AXObjectCacheImpl>(&cache), pending.slot));
+    EXPECT_TRUE(pending.slot->results.empty());
+    return pending;
+  }
+
   std::shared_ptr<StructuralProbe> QueueStructure(Node& source,
                                                  AXObjectCacheImpl& cache) {
     auto probe = std::make_shared<StructuralProbe>();
@@ -2957,6 +3820,58 @@ class SelectedSemanticRun12FixtureTest : public SimTest {
     EXPECT_EQ(1u, child_read.slot->results.size());
   }
 
+  void CheckExactWholeAction() {
+    std::vector<PositiveSource> sources;
+    ASSERT_NO_FATAL_FAILURE(BindMainPositives(
+        "lunar-document:safe:run-12:revision-1", sources));
+    for (const char* name : kRun12Cases) {
+      auto* anchor = Anchor(name);
+      ASSERT_NE(nullptr, anchor);
+      sources.push_back({WeakPersistent<Node>(anchor),
+          String("lunar-feasibility-anchor:") + name + ":run-12"});
+    }
+    ASSERT_EQ(16u, sources.size());
+    std::multiset<std::string> expected;
+    for (const auto& source : sources)
+      expected.insert(source.expected.Utf8().data());
+    auto& cache = CacheFor(GetDocument());
+    auto pending = QueueDocument(cache);
+    DriveAX(cache);
+    EXPECT_TRUE(pending.slot->results.empty());
+    task_environment().RunUntilIdle();
+    ASSERT_EQ(1u, pending.slot->results.size());
+    const auto& result = pending.slot->results.front();
+    EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+    EXPECT_EQ(SemanticRequestKindV1::kDocument, result.kind);
+    EXPECT_EQ(12u, result.epoch);
+    EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+              result.observation.disposition);
+    EXPECT_TRUE(result.node.text.empty());
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+    EXPECT_EQ(17u, result.audit.text_reads);
+    EXPECT_LE(result.budget.nodes, 256u);
+    EXPECT_LE(result.budget.fragments, 512u);
+    EXPECT_LE(result.budget.relation_steps, 4096u);
+    ASSERT_EQ(16u, result.observation.entries.size());
+    std::multiset<std::string> actual;
+    unsigned buttons = 0;
+    for (const auto& entry : result.observation.entries) {
+      actual.insert(entry.text.Utf8().data());
+      buttons += entry.role == SemanticObservationRoleV1::kButton;
+    }
+    EXPECT_EQ(expected, actual);
+    EXPECT_EQ(1u, buttons);
+    // The literal fixture places the four main entries first, followed by
+    // the twelve structural-case anchors in kRun12Cases DOM order.
+    for (unsigned i = 0; i < sources.size(); ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(sources[i].expected, result.observation.entries[i].text);
+      EXPECT_EQ(i == 2 ? SemanticObservationRoleV1::kButton
+                       : SemanticObservationRoleV1::kText,
+                result.observation.entries[i].role);
+    }
+  }
+
   void LoadExactSimple(const char* url, const char* literal) {
     ResizeView(gfx::Size(800, 600));
     SimRequest resource(url, "text/html");
@@ -2978,6 +3893,39 @@ class SelectedSemanticRun12FixtureTest : public SimTest {
     task_environment().RunUntilIdle();
     for (size_t i = 0; i < pending.size(); ++i)
       ASSERT_NO_FATAL_FAILURE(ExpectPositive(pending[i], sources[i].expected));
+  }
+
+  void CheckExactWholeSimple(const String& document_marker) {
+    std::vector<PositiveSource> sources;
+    ASSERT_NO_FATAL_FAILURE(BindMainPositives(document_marker, sources));
+    ASSERT_EQ(4u, sources.size());
+    std::multiset<std::string> expected;
+    for (const auto& source : sources)
+      expected.insert(source.expected.Utf8().data());
+    auto& cache = CacheFor(GetDocument());
+    auto pending = QueueDocument(cache);
+    DriveAX(cache);
+    EXPECT_TRUE(pending.slot->results.empty());
+    task_environment().RunUntilIdle();
+    ASSERT_EQ(1u, pending.slot->results.size());
+    const auto& result = pending.slot->results.front();
+    EXPECT_EQ(SemanticRequestKindV1::kDocument, result.kind);
+    EXPECT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+    EXPECT_EQ(SemanticDispositionV1::kAdmitted,
+              result.observation.disposition);
+    EXPECT_EQ(0u, result.audit.forbidden_reads);
+    ASSERT_EQ(4u, result.observation.entries.size());
+    std::multiset<std::string> actual;
+    for (const auto& entry : result.observation.entries)
+      actual.insert(entry.text.Utf8().data());
+    EXPECT_EQ(expected, actual);
+    for (unsigned i = 0; i < sources.size(); ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(sources[i].expected, result.observation.entries[i].text);
+      EXPECT_EQ(i == 2 ? SemanticObservationRoleV1::kButton
+                       : SemanticObservationRoleV1::kText,
+                result.observation.entries[i].role);
+    }
   }
 
   // Called only after ordinary lifecycle/real readiness. Uses actual fragment
@@ -3033,6 +3981,17 @@ TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12DesktopCapturesAllCases) {
   ASSERT_NO_FATAL_FAILURE(CheckExactAction());
 }
 
+TEST_F(SelectedSemanticRun12FixtureTest, WholeDocumentDesktopCapturesSixteen) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactAction(800));
+  ASSERT_NO_FATAL_FAILURE(CheckExactWholeAction());
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest, WholeDocumentNarrowCapturesSixteen) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactAction(360));
+  ASSERT_NO_FATAL_FAILURE(CheckExactWholeAction());
+  ASSERT_NO_FATAL_FAILURE(ExpectActualWrappedAnchor());
+}
+
 TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12NarrowCapturesAllCasesAndWraps) {
   ASSERT_NO_FATAL_FAILURE(LoadExactAction(360));
   ASSERT_NO_FATAL_FAILURE(CheckExactAction());
@@ -3045,16 +4004,37 @@ TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12NoopDocumentCompatibility) {
   ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:noop:run-12:revision-1"));
 }
 
+TEST_F(SelectedSemanticRun12FixtureTest, WholeDocumentNoopCapturesFour) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/action-noop", kRun12ActionNoop));
+  ASSERT_NO_FATAL_FAILURE(CheckExactWholeSimple(
+      "lunar-document:noop:run-12:revision-1"));
+}
+
 TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12ReloadOldDocumentCompatibility) {
   ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
       "https://lunar-policy.test/reload-old", kRun12ReloadOld));
   ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:reload-old:run-12:revision-1"));
 }
 
+TEST_F(SelectedSemanticRun12FixtureTest, WholeDocumentReloadOldCapturesFour) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/reload-old", kRun12ReloadOld));
+  ASSERT_NO_FATAL_FAILURE(CheckExactWholeSimple(
+      "lunar-document:reload-old:run-12:revision-1"));
+}
+
 TEST_F(SelectedSemanticRun12FixtureTest, ExactRun12ReloadNewDocumentCompatibility) {
   ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
       "https://lunar-policy.test/reload-new", kRun12ReloadNew));
   ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:reload-new:run-12:revision-2"));
+}
+
+TEST_F(SelectedSemanticRun12FixtureTest, WholeDocumentReloadNewCapturesFour) {
+  ASSERT_NO_FATAL_FAILURE(LoadExactSimple(
+      "https://lunar-policy.test/reload-new", kRun12ReloadNew));
+  ASSERT_NO_FATAL_FAILURE(CheckExactWholeSimple(
+      "lunar-document:reload-new:run-12:revision-2"));
 }
 
 TEST_F(SelectedSemanticRun12FixtureTest,
@@ -3068,6 +4048,8 @@ TEST_F(SelectedSemanticRun12FixtureTest,
       .getElementById(AtomicString("action-status"))->firstChild());
   ASSERT_NE(nullptr, old_target);
   auto pending = QueueRequest(*old_target, old_cache);
+  auto pending_document = QueueDocument(old_cache);
+  ASSERT_TRUE(SelectedSemanticRequestTestPeer::Pending(*pending_document.request));
 
   // Real simulated navigation and document replacement, not a manufactured
   // token/frame pointer. Do not drive the old AX callback before navigation.
@@ -3079,11 +4061,13 @@ TEST_F(SelectedSemanticRun12FixtureTest,
   if (old_document) EXPECT_FALSE(old_document->IsActive());
   ASSERT_NE(nullptr, GetDocument().getElementById(AtomicString("action-status")));
   EXPECT_TRUE(pending.slot->results.empty());
+  EXPECT_TRUE(pending_document.slot->results.empty());
 
   // The old cache can discard queued closures when disposed. Exercise the
   // delayed-handler fence explicitly after REAL replacement; this is not a
   // claim that Chromium naturally invokes a disposed cache's callback.
   SelectedSemanticRequestTestPeer::Ready(*pending.request);
+  SelectedSemanticRequestTestPeer::Ready(*pending_document.request);
   task_environment().RunUntilIdle();
   ASSERT_EQ(1u, pending.slot->results.size());
   const auto& stale = pending.slot->results.front();
@@ -3092,6 +4076,12 @@ TEST_F(SelectedSemanticRun12FixtureTest,
   EXPECT_EQ(0u, stale.audit.text_reads);
   EXPECT_EQ(0u, stale.audit.structural_reads);
   EXPECT_EQ(0u, stale.audit.forbidden_reads);
+  ASSERT_EQ(1u, pending_document.slot->results.size());
+  const auto& stale_document = pending_document.slot->results.front();
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, stale_document.kind);
+  EXPECT_EQ(Terminal::kStaleContext, stale_document.terminal);
+  EXPECT_TRUE(stale_document.observation.entries.empty());
+  EXPECT_EQ(0u, stale_document.audit.text_reads);
 
   // A separately admitted new request can read the exact replacement document.
   // It never substitutes for the old request, whose one result stays stale.
@@ -3099,8 +4089,10 @@ TEST_F(SelectedSemanticRun12FixtureTest,
   main_ax_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
   ASSERT_NO_FATAL_FAILURE(CheckExactSimple("lunar-document:reload-new:run-12:revision-2"));
   pending.request.reset();
+  pending_document.request.reset();
   task_environment().FastForwardBy(base::Seconds(6));
   EXPECT_EQ(1u, pending.slot->results.size());
+  EXPECT_EQ(1u, pending_document.slot->results.size());
 }
 
 TEST_F(SelectedSemanticRun12FixtureTest,
@@ -3183,7 +4175,10 @@ TEST_F(SelectedSemanticRun12FixtureTest,
   ASSERT_TRUE(child_text);
   main_ax_ = std::make_unique<AXContext>(GetDocument(), ui::kAXModeDefaultForTests);
   child_ax_ = std::make_unique<AXContext>(*child_document, ui::kAXModeDefaultForTests);
-  auto pending = QueueRequest(*child_text, CacheFor(*child_document));
+  auto& child_cache = CacheFor(*child_document);
+  auto pending = QueueRequest(*child_text, child_cache);
+  auto pending_document = QueueDocument(child_cache);
+  ASSERT_TRUE(SelectedSemanticRequestTestPeer::Pending(*pending_document.request));
 
   // Real DOM removal calls HTMLFrameOwnerElement::DisconnectContentFrame ->
   // Frame::Detach(kRemove). Keeping old objects alive tests stale ownership,
@@ -3194,10 +4189,12 @@ TEST_F(SelectedSemanticRun12FixtureTest,
   EXPECT_FALSE(child_document->IsActive());
   EXPECT_EQ(nullptr, iframe->ContentFrame());
   EXPECT_TRUE(pending.slot->results.empty());
+  EXPECT_TRUE(pending_document.slot->results.empty());
   // As with navigation, disposal may discard the original queued closure.
   // Explicit late-handler delivery tests its fence after real frame teardown;
   // it does not claim the disposed cache naturally emits an AX-ready callback.
   SelectedSemanticRequestTestPeer::Ready(*pending.request);
+  SelectedSemanticRequestTestPeer::Ready(*pending_document.request);
   task_environment().RunUntilIdle();
   ASSERT_EQ(1u, pending.slot->results.size());
   const auto& result = pending.slot->results.front();
@@ -3206,9 +4203,17 @@ TEST_F(SelectedSemanticRun12FixtureTest,
   EXPECT_EQ(0u, result.audit.text_reads);
   EXPECT_EQ(0u, result.audit.structural_reads);
   EXPECT_EQ(0u, result.audit.forbidden_reads);
+  ASSERT_EQ(1u, pending_document.slot->results.size());
+  const auto& document_result = pending_document.slot->results.front();
+  EXPECT_EQ(SemanticRequestKindV1::kDocument, document_result.kind);
+  EXPECT_EQ(Terminal::kStaleContext, document_result.terminal);
+  EXPECT_TRUE(document_result.observation.entries.empty());
+  EXPECT_EQ(0u, document_result.audit.text_reads);
   pending.request.reset();
+  pending_document.request.reset();
   task_environment().FastForwardBy(base::Seconds(6));
   EXPECT_EQ(1u, pending.slot->results.size());
+  EXPECT_EQ(1u, pending_document.slot->results.size());
 }
 
 }  // namespace

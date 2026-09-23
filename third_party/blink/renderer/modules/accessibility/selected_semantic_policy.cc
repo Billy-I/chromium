@@ -5,6 +5,7 @@
 #include "third_party/blink/renderer/modules/accessibility/selected_semantic_policy.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -100,7 +101,8 @@ class SelectedSemanticPolicyReadAccess {
   static SemanticNodeResultV1 Content(Node& node,
                                       SelectedSemanticReadScope& scope,
                                       SemanticBudgetV1& budget,
-                                      SemanticAuditV1& audit) {
+                                      SemanticAuditV1& audit,
+                                      bool* malformed_encoding = nullptr) {
     String value;
     if (auto* text = DynamicTo<Text>(node)) {
       if (text->length() > 4096) return {Disposition::kLimitExceeded, {}};
@@ -139,7 +141,10 @@ class SelectedSemanticPolicyReadAccess {
       return {Disposition::kLimitExceeded, {}};
     // UTF-16 bound limits this conversion's temporary allocation to 16KiB.
     const auto bytes = value.Utf8(Utf8ConversionMode::kStrict);
-    if (bytes.empty()) return {Disposition::kUnsupportedText, {}};
+    if (bytes.empty()) {
+      if (malformed_encoding) *malformed_encoding = true;
+      return {Disposition::kUnsupportedText, {}};
+    }
     if (bytes.size() > 4096 || bytes.size() > 65536 - budget.utf8_bytes)
       return {Disposition::kLimitExceeded, {}};
     budget.utf8_bytes += static_cast<unsigned>(bytes.size());
@@ -158,6 +163,89 @@ bool ChargeSteps(SemanticBudgetV1& budget, unsigned steps) {
   budget.relation_steps += steps;
   return true;
 }
+
+// Checkpoint-local identities. No key in either table enters the posted result.
+class SemanticIdentityLedger {
+ public:
+  enum class Kind : uint8_t { kNode, kLayout, kAX };
+
+  bool Visit(const void* pointer, Kind kind, SemanticBudgetV1& budget) {
+    CHECK(pointer);
+    const size_t initial = Hash(pointer, kind) & (slots_.size() - 1);
+    for (size_t probe = 0; probe < slots_.size(); ++probe) {
+      if (!ChargeSteps(budget, 1)) return false;
+      Key& key = slots_[(initial + probe) & (slots_.size() - 1)];
+      if (key.pointer == pointer && key.kind == kind) return true;
+      if (!key.pointer) {
+        if (budget.nodes >= 256) return false;
+        key = {pointer, kind};
+        ++budget.nodes;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool VisitNode(const Node& node, SemanticBudgetV1& budget) {
+    return Visit(&node, Kind::kNode, budget);
+  }
+
+  bool VisitLayout(const LayoutObject& layout, SemanticBudgetV1& budget) {
+    // Only an exact own layout association shares its DOM source identity.
+    const Node* source = layout.GetNode();
+    if (source && source->GetLayoutObject() == &layout)
+      return VisitNode(*source, budget);
+    return Visit(&layout, Kind::kLayout, budget);
+  }
+
+  bool VisitAX(const AXObject& object, SemanticBudgetV1& budget) {
+    if (const Node* source = object.GetNode())
+      return VisitNode(*source, budget);
+    return Visit(&object, Kind::kAX, budget);
+  }
+
+ private:
+  struct Key {
+    const void* pointer = nullptr;
+    Kind kind = Kind::kNode;
+  };
+  static size_t Hash(const void* pointer, Kind kind) {
+    uint64_t value = reinterpret_cast<uintptr_t>(pointer) >> 3;
+    value ^= value >> 33;
+    value *= UINT64_C(0xff51afd7ed558ccd);
+    value ^= value >> 33;
+    return static_cast<size_t>(value ^ static_cast<uint64_t>(kind));
+  }
+  // At most 256 occupied slots; fixed capacity prevents growth or rehash work.
+  std::array<Key, 1024> slots_{};
+};
+
+class SemanticAXVisitLedger {
+ public:
+  bool Insert(const AXObject& object, SemanticBudgetV1& budget) {
+    uint64_t hash = reinterpret_cast<uintptr_t>(&object) >> 3;
+    hash ^= hash >> 33;
+    hash *= UINT64_C(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    const size_t initial = static_cast<size_t>(hash) & (slots_.size() - 1);
+    for (size_t probe = 0; probe < slots_.size(); ++probe) {
+      if (!ChargeSteps(budget, 1)) return false;
+      const AXObject*& slot = slots_[(initial + probe) & (slots_.size() - 1)];
+      if (slot == &object) return false;  // Repeated DFS edge or cycle.
+      if (!slot) {
+        if (count_ >= 256) return false;
+        slot = &object;
+        ++count_;
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  std::array<const AXObject*, 1024> slots_{};
+  unsigned count_ = 0;
+};
 
 bool HasExistingScrollAnimation(const ScrollableArea& area) {
   auto* scroll = area.ExistingScrollAnimator();
@@ -374,7 +462,8 @@ Disposition ExistingIdentityInterval(const Text& source, const LayoutText& text,
 }
 
 Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
-                             bool require_full_text) {
+                             bool require_full_text,
+                             SemanticIdentityLedger* ledger = nullptr) {
   if (object.IsDetached()) {
     return Disposition::kStaleDocument;
   }
@@ -420,7 +509,7 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
     return Disposition::kNotReady;
   }
   const LayoutView* root = document.GetLayoutView();
-  if (!root || budget.nodes >= 256 || budget.depth > 64 ||
+  if (!root || (!ledger && budget.nodes >= 256) || budget.depth > 64 ||
       budget.fragments >= 512) {
     return root ? Disposition::kLimitExceeded : Disposition::kNotReady;
   }
@@ -435,11 +524,13 @@ Disposition ClassifyGeometry(AXObject& object, SemanticBudgetV1& budget,
     if (!current) {
       return Disposition::kUnsupportedGeometry;
     }
-    if (chain_length >= 64 || budget.nodes >= 256 || !ChargeSteps(budget, 1)) {
+    if (chain_length >= 64 || (!ledger && budget.nodes >= 256) ||
+        !ChargeSteps(budget, 1) ||
+        (ledger && !ledger->VisitLayout(*current, budget))) {
       return Disposition::kLimitExceeded;
     }
     ++chain_length;
-    ++budget.nodes;
+    if (!ledger) ++budget.nodes;
     budget.depth = std::max(budget.depth, chain_length);
     Disposition checked = CheckMappingObject(*current, *root, text);
     if (checked != Disposition::kAdmitted) {
@@ -598,7 +689,9 @@ bool IsPlainContainer(const Element& element) {
 
 Disposition ClassifyStructure(Node& source, AXObjectCacheImpl& cache,
                                SemanticBudgetV1& budget,
-                               SelectedSemanticReadScope& scope) {
+                               SelectedSemanticReadScope& scope,
+                               SemanticIdentityLedger* ledger = nullptr,
+                               bool traverse_container = false) {
   Disposition ready = CaptureState(source, cache);
   if (ready != Disposition::kAdmitted) return ready;
   const Document& document = source.GetDocument();
@@ -606,9 +699,11 @@ Disposition ClassifyStructure(Node& source, AXObjectCacheImpl& cache,
   bool within_cached_modal = !modal;
   unsigned depth = 0;
   for (const Node* current = &source; current; current = current->parentNode()) {
-    if (budget.nodes >= 256 || ++depth > 64 || !ChargeSteps(budget, 1))
+    if ((!ledger && budget.nodes >= 256) || ++depth > 64 ||
+        !ChargeSteps(budget, 1) ||
+        (ledger && !ledger->VisitNode(*current, budget)))
       return Disposition::kLimitExceeded;
-    ++budget.nodes;
+    if (!ledger) ++budget.nodes;
     budget.depth = std::max(budget.depth, depth);
     if (&current->GetDocument() != &document || !current->isConnected())
       return Disposition::kStaleDocument;
@@ -651,7 +746,8 @@ Disposition ClassifyStructure(Node& source, AXObjectCacheImpl& cache,
       // returns its cached interpreted role.
       const auto role = associated->RawAriaRole();
       if (role != ax::mojom::blink::Role::kNone &&
-          !(role == ax::mojom::blink::Role::kGroup && current != &source &&
+          !(role == ax::mojom::blink::Role::kGroup &&
+            (current != &source || traverse_container) &&
             !element->HasTagName(html_names::kButtonTag)) &&
           !(element->HasTagName(html_names::kButtonTag) &&
             role == ax::mojom::blink::Role::kButton))
@@ -701,14 +797,16 @@ SemanticDispositionV1 ClassifySelectedStructureV1(
   return scope.IsClean() ? result : Disposition::kNotReady;
 }
 
-SemanticNodeResultV1 ReadSelectedSemanticNodeV1(AXObject& object,
-                                              SemanticBudgetV1& budget,
-                                              SemanticAuditV1& audit) {
+namespace {
+SemanticNodeResultV1 ReadScopedNode(AXObject& object,
+                                    SemanticBudgetV1& budget,
+                                    SemanticAuditV1& audit,
+                                    SelectedSemanticReadScope& scope,
+                                    SemanticIdentityLedger* ledger = nullptr,
+                                    bool* malformed_encoding = nullptr) {
   if (object.IsDetached() || !object.GetNode())
     return {Disposition::kStaleDocument, {}};
   Node& node = *object.GetNode();
-  SelectedSemanticReadScope scope(node.GetDocument());
-  const auto before = scope.ReadCounts();
   auto read = [&]() -> SemanticNodeResultV1 {
     if (!scope.IsClean()) return {};
     Disposition ready = CaptureState(node, object.AXObjectCache());
@@ -722,16 +820,181 @@ SemanticNodeResultV1 ReadSelectedSemanticNodeV1(AXObject& object,
           role != ax::mojom::blink::Role::kButton)))
       return {Disposition::kUnsupportedText, {}};
     Disposition structure = ClassifyStructure(
-        node, object.AXObjectCache(), budget, scope);
+        node, object.AXObjectCache(), budget, scope, ledger);
     if (structure != Disposition::kAdmitted) return {structure, {}};
-    Disposition geometry = ClassifyGeometry(object, budget, node.IsTextNode());
+    Disposition geometry = ClassifyGeometry(object, budget, node.IsTextNode(), ledger);
     if (geometry != Disposition::kAdmitted) return {geometry, {}};
-    return SelectedSemanticPolicyReadAccess::Content(node, scope, budget, audit);
+    return SelectedSemanticPolicyReadAccess::Content(
+        node, scope, budget, audit, malformed_encoding);
   };
-  SemanticNodeResultV1 result = read();
+  return read();
+}
+}  // namespace
+
+SemanticNodeResultV1 ReadSelectedSemanticNodeV1(AXObject& object,
+                                              SemanticBudgetV1& budget,
+                                              SemanticAuditV1& audit) {
+  if (object.IsDetached() || !object.GetNode())
+    return {Disposition::kStaleDocument, {}};
+  SelectedSemanticReadScope scope(object.GetNode()->GetDocument());
+  const auto before = scope.ReadCounts();
+  SemanticNodeResultV1 result = ReadScopedNode(object, budget, audit, scope);
   AccountScope(scope, before, audit);
   return scope.IsClean() ? result : SemanticNodeResultV1{};
 }
+
+namespace {
+bool CleanCachedObject(const AXObject& object, AXObjectCacheImpl& cache) {
+  return !object.IsDetached() && &object.AXObjectCache() == &cache &&
+         !object.NeedsToUpdateCachedValues() &&
+         !object.ChildrenNeedToUpdateCachedValues() &&
+         !object.HasDirtyDescendants() && !object.NeedsToUpdateChildren();
+}
+
+Disposition CheckIncludedParent(const AXObject& child,
+                                const AXObject& included_parent,
+                                Document& document, AXObjectCacheImpl& cache,
+                                SemanticBudgetV1& budget,
+                                SemanticIdentityLedger& identities) {
+  std::array<const AXObject*, 64> walked{};
+  unsigned count = 0;
+  for (const AXObject* parent = child.ParentObjectIfPresent(); parent;
+       parent = parent->ParentObjectIfPresent()) {
+    if (count >= walked.size() || !ChargeSteps(budget, 1))
+      return Disposition::kLimitExceeded;
+    if (!CleanCachedObject(*parent, cache)) return Disposition::kNotReady;
+    for (unsigned i = 0; i < count; ++i) {
+      if (!ChargeSteps(budget, 1)) return Disposition::kLimitExceeded;
+      if (walked[i] == parent) return Disposition::kStaleDocument;
+    }
+    walked[count++] = parent;
+    budget.depth = std::max(budget.depth, count);
+    const Node* source = parent->GetNode();
+    if (source &&
+        (&source->GetDocument() != &document || cache.Get(source) != parent))
+      return Disposition::kStaleDocument;
+    if (!identities.VisitAX(*parent, budget))
+      return Disposition::kLimitExceeded;
+    if (parent->IsIncludedInTree())
+      return parent == &included_parent ? Disposition::kAdmitted
+                                         : Disposition::kStaleDocument;
+  }
+  return Disposition::kStaleDocument;
+}
+
+SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
+    Document& document, AXObjectCacheImpl& cache, SemanticBudgetV1& budget,
+    SemanticAuditV1& audit) {
+  SemanticObservationV1 observation;
+  SelectedSemanticReadScope scope(document);
+  const auto before = scope.ReadCounts();
+  SemanticIdentityLedger identities;
+  SemanticAXVisitLedger visited;
+  bool malformed_encoding = false;
+  auto capture = [&]() -> Disposition {
+    if (!scope.IsClean()) return Disposition::kNotReady;
+    Disposition ready = CaptureState(document, cache);
+    if (ready != Disposition::kAdmitted) return ready;
+    const AXObject* root = cache.Get(&document);
+    if (!root || !CleanCachedObject(*root, cache) ||
+        root->GetNode() != &document ||
+        root->RoleValue() != ax::mojom::blink::Role::kRootWebArea ||
+        root->ParentObjectIfPresent())
+      return Disposition::kNotReady;
+
+    auto descend = [&](auto&& self, const AXObject& object,
+                       const AXObject* included_parent,
+                       unsigned depth) -> Disposition {
+      if (depth > 64 || !ChargeSteps(budget, 1))
+        return Disposition::kLimitExceeded;
+      budget.depth = std::max(budget.depth, depth);
+      if (!CleanCachedObject(object, cache)) return Disposition::kNotReady;
+      if (included_parent) {
+        if (!object.IsIncludedInTree()) return Disposition::kStaleDocument;
+        Disposition parent = CheckIncludedParent(
+            object, *included_parent, document, cache, budget, identities);
+        if (parent != Disposition::kAdmitted) return parent;
+      }
+      if (!visited.Insert(object, budget)) return Disposition::kLimitExceeded;
+      const Node* source = object.GetNode();
+      if (source &&
+          (&source->GetDocument() != &document || cache.Get(source) != &object))
+        return Disposition::kStaleDocument;
+      if (!identities.VisitAX(object, budget))
+        return Disposition::kLimitExceeded;
+      // No closest-owner rebinding: source-less objects are closed subtrees.
+      if (!source) return Disposition::kAdmitted;
+      if (source != &document && !source->isConnected())
+        return Disposition::kStaleDocument;
+
+      if (source->IsTextNode() || source->HasTagName(html_names::kButtonTag)) {
+        if (source->IsTextNode()) {
+          const LayoutObject* ax_layout = object.GetLayoutObject();
+          const LayoutObject* own_layout = source->GetLayoutObject();
+          if (!ax_layout && !own_layout) return Disposition::kAdmitted;
+          if (ax_layout != own_layout) return Disposition::kNotReady;
+        }
+        SemanticNodeResultV1 node = ReadScopedNode(
+            const_cast<AXObject&>(object), budget, audit, scope, &identities,
+            &malformed_encoding);
+        if (malformed_encoding || !scope.IsClean())
+          return Disposition::kUnsupportedText;
+        if (node.disposition == Disposition::kStaleDocument ||
+            node.disposition == Disposition::kNotReady ||
+            node.disposition == Disposition::kLimitExceeded)
+          return node.disposition;
+        if (node.disposition != Disposition::kAdmitted)
+          return Disposition::kAdmitted;  // Closed local leaf exclusion.
+        const auto bytes = node.text.Utf8(Utf8ConversionMode::kStrict);
+        if (bytes.empty()) return Disposition::kUnsupportedText;
+        const uint64_t padded = (static_cast<uint64_t>(bytes.size()) + 7) & ~7ULL;
+        const uint64_t next = (observation.entries.empty()
+            ? 256ULL : observation.reserved_output_bytes) + 64 + padded;
+        if (observation.entries.size() >= 256 || next > 65536)
+          return Disposition::kLimitExceeded;
+        observation.reserved_output_bytes = static_cast<unsigned>(next);
+        observation.entries.push_back(SemanticObservationEntryV1{source->IsTextNode()
+            ? SemanticObservationRoleV1::kText
+            : SemanticObservationRoleV1::kButton, std::move(node.text)});
+        return Disposition::kAdmitted;
+      }
+
+      if (source != &document) {
+        if (!DynamicTo<Element>(source)) return Disposition::kAdmitted;
+        Disposition structural = ClassifyStructure(
+            *const_cast<Node*>(source), cache, budget, scope, &identities,
+            /*traverse_container=*/true);
+        if (structural == Disposition::kForbiddenAncestor ||
+            structural == Disposition::kUnsupportedText)
+          return Disposition::kAdmitted;  // Entire forbidden subtree.
+        if (structural != Disposition::kAdmitted) return structural;
+      }
+      const auto& children = object.ChildrenIncludingIgnored();
+      if (children.size() > 256) return Disposition::kLimitExceeded;
+      for (const auto& member : children) {
+        const AXObject* child = member.Get();
+        if (!child) return Disposition::kStaleDocument;
+        Disposition branch = self(self, *child, &object, depth + 1);
+        if (branch != Disposition::kAdmitted) return branch;
+      }
+      return Disposition::kAdmitted;
+    };
+    return descend(descend, *root, nullptr, 1);
+  };
+  Disposition result = capture();
+  AccountScope(scope, before, audit);
+  if (!scope.IsClean()) result = Disposition::kNotReady;
+  if (malformed_encoding) result = Disposition::kUnsupportedText;
+  if (result != Disposition::kAdmitted) {
+    observation = {};
+    observation.disposition = result;
+  } else {
+    observation.disposition = Disposition::kAdmitted;
+    if (observation.entries.empty()) observation.reserved_output_bytes = 256;
+  }
+  return observation;
+}
+}  // namespace
 
 std::unique_ptr<SelectedSemanticRequestV1> SelectedSemanticRequestV1::Create(
     Document& document, AXObjectCacheImpl& cache, Node& node, uint64_t epoch,
@@ -746,13 +1009,29 @@ std::unique_ptr<SelectedSemanticRequestV1> SelectedSemanticRequestV1::Create(
   return request;
 }
 
+std::unique_ptr<SelectedSemanticRequestV1>
+SelectedSemanticRequestV1::CreateDocument(
+    Document& document, AXObjectCacheImpl& cache, uint64_t epoch,
+    base::TimeTicks deadline,
+    scoped_refptr<base::SingleThreadTaskRunner> task_runner,
+    Completion completion) {
+  CHECK(IsMainThread());
+  auto request = std::unique_ptr<SelectedSemanticRequestV1>(
+      new SelectedSemanticRequestV1(
+          document, cache, document, epoch, deadline, std::move(task_runner),
+          std::move(completion), base::DefaultTickClock::GetInstance(),
+          SemanticRequestKindV1::kDocument));
+  request->Start();
+  return request;
+}
+
 SelectedSemanticRequestV1::SelectedSemanticRequestV1(
     Document& document, AXObjectCacheImpl& cache, Node& node, uint64_t epoch,
     base::TimeTicks deadline,
     scoped_refptr<base::SingleThreadTaskRunner> task_runner, Completion completion,
-    const base::TickClock* clock)
+    const base::TickClock* clock, SemanticRequestKindV1 kind)
     : document_(&document), frame_(document.GetFrame()), node_(&node),
-      cache_(&cache), clock_(clock), epoch_(epoch), deadline_(deadline),
+      cache_(&cache), clock_(clock), epoch_(epoch), kind_(kind), deadline_(deadline),
       task_runner_(std::move(task_runner)), completion_(std::move(completion)),
       timer_(clock_) {
   CHECK(task_runner_ && task_runner_->RunsTasksInCurrentSequence());
@@ -837,7 +1116,10 @@ void SelectedSemanticRequestV1::OnAXReady() {
   // default NotReady node without asking AX to create or update anything.
   if (cache_->IsFrozen()) {
     ScriptForbiddenScope forbid_script;
-    if (AXObject* object = cache_->Get(node_.Get()))
+    if (kind_ == SemanticRequestKindV1::kDocument) {
+      result.observation = CaptureSelectedSemanticDocumentV1(
+          *document_, *cache_, result.budget, result.audit);
+    } else if (AXObject* object = cache_->Get(node_.Get()))
       result.node = ReadSelectedSemanticNodeV1(*object, result.budget, result.audit);
     else
       result.node.disposition = SemanticDispositionV1::kStaleDocument;
@@ -877,8 +1159,13 @@ void SelectedSemanticRequestV1::Finish(SemanticRequestResultV1 result) {
   timer_.Stop();
   weak_factory_.InvalidateWeakPtrs();
   result.epoch = epoch_;
-  if (result.terminal != SemanticRequestTerminalV1::kPolicyResult)
+  result.kind = kind_;
+  if (result.terminal != SemanticRequestTerminalV1::kPolicyResult) {
     result.node = {};
+    result.observation = {};
+  } else if (kind_ == SemanticRequestKindV1::kDocument) {
+    result.node = {};
+  }
   // Terminal commit is the cancellation linearization point. Later Cancel()
   // does not retract this immutable queued result. The result and request-added
   // delivery arguments contain no DOM/request pointers. Callback capture
