@@ -27,6 +27,7 @@
 #include "third_party/blink/renderer/core/frame/local_frame_view.h"
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -834,6 +835,12 @@ void LocalFrameView::PerformLayout() {
   }
 
   Lifecycle().AdvanceTo(DocumentLifecycle::kAfterPerformLayout);
+  if (layout_generation_for_selected_semantic_ ==
+      std::numeric_limits<uint64_t>::max()) {
+    layout_generation_for_selected_semantic_ = 0;
+  } else if (layout_generation_for_selected_semantic_) {
+    ++layout_generation_for_selected_semantic_;
+  }
 
   TRACE_EVENT_END(PERFORM_LAYOUT_TRACE_CATEGORIES);
   FirstMeaningfulPaintDetector::From(*document)

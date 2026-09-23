@@ -14,6 +14,7 @@
 #include "third_party/blink/renderer/core/dom/node.h"
 #include "third_party/blink/renderer/core/dom/text.h"
 #include "third_party/blink/renderer/core/frame/local_frame.h"
+#include "third_party/blink/renderer/core/frame/local_frame_view.h"
 #include "third_party/blink/renderer/core/frame/settings.h"
 #include "third_party/blink/renderer/core/frame/visual_viewport.h"
 #include "third_party/blink/renderer/core/layout/geometry/transform_state.h"
@@ -884,8 +885,9 @@ Disposition CheckIncludedParent(const AXObject& child,
 
 SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
     Document& document, AXObjectCacheImpl& cache, SemanticBudgetV1& budget,
-    SemanticAuditV1& audit) {
+    SemanticAuditV1& audit, Vector<SemanticButtonBindingV1>& button_bindings) {
   SemanticObservationV1 observation;
+  button_bindings.clear();
   SelectedSemanticReadScope scope(document);
   const auto before = scope.ReadCounts();
   SemanticIdentityLedger identities;
@@ -953,6 +955,11 @@ SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
         if (observation.entries.size() >= 256 || next > 65536)
           return Disposition::kLimitExceeded;
         observation.reserved_output_bytes = static_cast<unsigned>(next);
+        if (source->HasTagName(html_names::kButtonTag)) {
+          button_bindings.push_back(
+              SemanticButtonBindingV1{observation.entries.size(),
+                                      WeakPersistent<Node>(const_cast<Node*>(source))});
+        }
         observation.entries.push_back(SemanticObservationEntryV1{source->IsTextNode()
             ? SemanticObservationRoleV1::kText
             : SemanticObservationRoleV1::kButton, std::move(node.text)});
@@ -987,6 +994,7 @@ SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
   if (malformed_encoding) result = Disposition::kUnsupportedText;
   if (result != Disposition::kAdmitted) {
     observation = {};
+    button_bindings.clear();
     observation.disposition = result;
   } else {
     observation.disposition = Disposition::kAdmitted;
@@ -1117,8 +1125,40 @@ void SelectedSemanticRequestV1::OnAXReady() {
   if (cache_->IsFrozen()) {
     ScriptForbiddenScope forbid_script;
     if (kind_ == SemanticRequestKindV1::kDocument) {
+      const uint64_t before_tree_version = document_->DomTreeVersion();
+      const uint64_t before_style_version = document_->StyleVersion();
+      const uint64_t before_layout_generation =
+          document_->View()
+              ? document_->View()->LayoutGenerationForSelectedSemantic()
+              : 0;
       result.observation = CaptureSelectedSemanticDocumentV1(
-          *document_, *cache_, result.budget, result.audit);
+          *document_, *cache_, result.budget, result.audit, button_bindings_);
+      if (result.observation.disposition == SemanticDispositionV1::kAdmitted &&
+          document_->DomTreeVersion() == before_tree_version &&
+          document_->StyleVersion() == before_style_version &&
+          before_layout_generation && document_->View() &&
+          document_->View()->LayoutGenerationForSelectedSemantic() ==
+              before_layout_generation) {
+        const auto snapshot = CaptureScrollSnapshot(result.budget);
+        if (snapshot == SemanticDispositionV1::kAdmitted &&
+            document_->View()->LayoutGenerationForSelectedSemantic() ==
+                before_layout_generation) {
+          result.document_tree_version = before_tree_version;
+          result.document_style_version = before_style_version;
+          result.document_layout_generation = before_layout_generation;
+          layout_generation_snapshot_ = before_layout_generation;
+        } else {
+          result.observation = {};
+          result.observation.disposition =
+              snapshot == SemanticDispositionV1::kAdmitted
+                  ? SemanticDispositionV1::kStaleDocument
+                  : snapshot;
+          button_bindings_.clear();
+        }
+      } else if (result.observation.disposition ==
+                 SemanticDispositionV1::kAdmitted) {
+        result.terminal = SemanticRequestTerminalV1::kStaleContext;
+      }
     } else if (AXObject* object = cache_->Get(node_.Get()))
       result.node = ReadSelectedSemanticNodeV1(*object, result.budget, result.audit);
     else
@@ -1163,17 +1203,119 @@ void SelectedSemanticRequestV1::Finish(SemanticRequestResultV1 result) {
   if (result.terminal != SemanticRequestTerminalV1::kPolicyResult) {
     result.node = {};
     result.observation = {};
+    button_bindings_.clear();
+    result.document_tree_version = 0;
+    result.document_style_version = 0;
+    result.document_layout_generation = 0;
+    layout_generation_snapshot_ = 0;
+    scroll_snapshot_valid_ = false;
+    scroll_bindings_.clear();
   } else if (kind_ == SemanticRequestKindV1::kDocument) {
     result.node = {};
+    if (result.observation.disposition != SemanticDispositionV1::kAdmitted) {
+      button_bindings_.clear();
+      result.document_tree_version = 0;
+      result.document_style_version = 0;
+      result.document_layout_generation = 0;
+      layout_generation_snapshot_ = 0;
+      scroll_snapshot_valid_ = false;
+      scroll_bindings_.clear();
+    }
   }
-  // Terminal commit is the cancellation linearization point. Later Cancel()
-  // does not retract this immutable queued result. The result and request-added
+  // Terminal commit is this request's cancellation linearization point. A
+  // higher-level session can still revoke the queued result at delivery.
+  // The result and request-added
   // delivery arguments contain no DOM/request pointers. Callback capture
   // lifetime remains the caller's responsibility; the client is never called inline.
   // Delivery is conditional on the documented accepting-runner precondition.
   // A runner shutdown never turns into inline client code inside frozen AX.
   task_runner_->PostTask(FROM_HERE,
       base::BindOnce(std::move(completion_), std::move(result)));
+}
+
+Vector<SemanticButtonBindingV1>
+SelectedSemanticRequestV1::TakeButtonBindings() {
+  CHECK(IsMainThread() && task_runner_->RunsTasksInCurrentSequence());
+  CHECK(terminal_ && kind_ == SemanticRequestKindV1::kDocument);
+  return std::move(button_bindings_);
+}
+
+SemanticDispositionV1 SelectedSemanticRequestV1::CaptureScrollSnapshot(
+    SemanticBudgetV1& budget) {
+  CHECK(IsMainThread() && task_runner_->RunsTasksInCurrentSequence());
+  scroll_snapshot_valid_ = false;
+  scroll_bindings_.clear();
+  LocalFrameView* view = document_->View();
+  if (!view || view != frame_->View() || !document_->GetPage() ||
+      !view->GetScrollableArea()) {
+    return SemanticDispositionV1::kNotReady;
+  }
+  const auto& areas = view->ScrollableAreas();
+  if (areas.size() > 256)
+    return SemanticDispositionV1::kLimitExceeded;
+  // Reserve both capture and later delivery comparisons under the same
+  // relation-step ceiling before inspecting any area.
+  if (!ChargeSteps(budget, static_cast<unsigned>(2 * areas.size() + 2)))
+    return SemanticDispositionV1::kLimitExceeded;
+  auto& visual = document_->GetPage()->GetVisualViewport();
+  scroll_view_ = view;
+  layout_scroll_offset_ = view->GetScrollableArea()->GetScrollOffset();
+  layout_visible_rect_ =
+      view->GetScrollableArea()->VisibleContentRect(kExcludeScrollbars);
+  visual_scroll_offset_ = visual.GetScrollOffset();
+  visual_visible_rect_ = visual.VisibleContentRect(kExcludeScrollbars);
+  visual_scale_ = visual.Scale();
+  for (const auto& area : areas.Values()) {
+    if (!area || HasExistingScrollAnimation(*area)) {
+      scroll_bindings_.clear();
+      return SemanticDispositionV1::kUnsupportedGeometry;
+    }
+    scroll_bindings_.push_back(SemanticScrollBindingV1{
+        WeakPersistent<PaintLayerScrollableArea>(area.Get()),
+        area->GetScrollOffset()});
+  }
+  scroll_snapshot_valid_ = true;
+  return SemanticDispositionV1::kAdmitted;
+}
+
+bool SelectedSemanticRequestV1::HasCurrentScrollGeometry() const {
+  CHECK(IsMainThread() && task_runner_->RunsTasksInCurrentSequence());
+  if (!scroll_snapshot_valid_ || !HasCurrentOwnership() ||
+      !scroll_view_ || document_->View() != scroll_view_.Get() ||
+      !layout_generation_snapshot_ ||
+      scroll_view_->LayoutGenerationForSelectedSemantic() !=
+          layout_generation_snapshot_ ||
+      !document_->GetPage() || document_->NeedsLayoutTreeUpdate() ||
+      scroll_view_->NeedsLayout() || !scroll_view_->GetScrollableArea()) {
+    return false;
+  }
+  const auto& visual = document_->GetPage()->GetVisualViewport();
+  if (visual.NeedsPaintPropertyUpdate() || visual.IsPinchGestureActive() ||
+      visual.BrowserControlsAdjustment() ||
+      visual.GetDeviceEmulationTransformNode() ||
+      HasExistingScrollAnimation(visual) ||
+      visual.Scale() != visual_scale_ ||
+      visual.GetScrollOffset() != visual_scroll_offset_ ||
+      visual.VisibleContentRect(kExcludeScrollbars) != visual_visible_rect_ ||
+      scroll_view_->GetScrollableArea()->GetScrollOffset() !=
+          layout_scroll_offset_ ||
+      scroll_view_->GetScrollableArea()->VisibleContentRect(
+          kExcludeScrollbars) != layout_visible_rect_) {
+    return false;
+  }
+  const auto& areas = scroll_view_->ScrollableAreas();
+  if (areas.size() != scroll_bindings_.size())
+    return false;
+  unsigned index = 0;
+  for (const auto& area : areas.Values()) {
+    const auto& captured = scroll_bindings_[index++];
+    if (!area || area.Get() != captured.area.Get() ||
+        area->GetScrollOffset() != captured.offset ||
+        HasExistingScrollAnimation(*area)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace blink

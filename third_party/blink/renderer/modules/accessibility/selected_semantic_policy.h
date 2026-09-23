@@ -20,12 +20,16 @@
 #include "third_party/blink/public/common/tokens/tokens.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
 #include "third_party/blink/renderer/platform/wtf/vector.h"
+#include "ui/gfx/geometry/rect.h"
+#include "ui/gfx/geometry/vector2d_f.h"
 
 namespace blink {
 
 class AXObject;
 class AXObjectCacheImpl;
 class Node;
+class LocalFrameView;
+class PaintLayerScrollableArea;
 
 enum class SemanticDispositionV1 {
   kAdmitted,
@@ -85,6 +89,15 @@ struct SemanticObservationV1 {
   Vector<SemanticObservationEntryV1> entries;
   unsigned reserved_output_bytes = 0;
 };
+// Renderer-local only. No Node association is posted with a request result.
+struct SemanticButtonBindingV1 {
+  unsigned entry_index;
+  WeakPersistent<Node> node;
+};
+struct SemanticScrollBindingV1 {
+  WeakPersistent<PaintLayerScrollableArea> area;
+  gfx::Vector2dF offset;
+};
 struct SemanticRequestResultV1 {
   SemanticRequestTerminalV1 terminal = SemanticRequestTerminalV1::kInvalidRequest;
   SemanticRequestKindV1 kind = SemanticRequestKindV1::kNode;
@@ -93,6 +106,10 @@ struct SemanticRequestResultV1 {
   SemanticObservationV1 observation;
   SemanticBudgetV1 budget;
   SemanticAuditV1 audit;
+  // Snapshot-only scalar. No DOM/AX association enters the posted value.
+  uint64_t document_tree_version = 0;
+  uint64_t document_style_version = 0;
+  uint64_t document_layout_generation = 0;
 };
 
 // One renderer-main-sequence request, with no CEF/browser identity authority.
@@ -116,6 +133,13 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   SelectedSemanticRequestV1& operator=(const SelectedSemanticRequestV1&) = delete;
   void Cancel();
   void InvalidateEpoch(uint64_t current_epoch);
+  // Renderer-main-sequence sidecar consumed only after posted result delivery.
+  // The owner must retain this request until that delivery runs.
+  Vector<SemanticButtonBindingV1> TakeButtonBindings();
+  // Compares the exact main-frame view and every registered scrollable area
+  // against the clean capture checkpoint. Compositor-only motion remains a
+  // separate browser completion obligation.
+  bool HasCurrentScrollGeometry() const;
 
  private:
   friend class SelectedSemanticRequestTestPeer;
@@ -129,6 +153,7 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   void OnDeadline();
   bool HasCurrentOwnership() const;
   void Finish(SemanticRequestResultV1);
+  SemanticDispositionV1 CaptureScrollSnapshot(SemanticBudgetV1&);
 
   WeakPersistent<Document> document_;
   WeakPersistent<LocalFrame> frame_;
@@ -142,6 +167,16 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   const base::TimeTicks deadline_;
   scoped_refptr<base::SingleThreadTaskRunner> task_runner_;
   Completion completion_;
+  Vector<SemanticButtonBindingV1> button_bindings_;
+  WeakPersistent<LocalFrameView> scroll_view_;
+  Vector<SemanticScrollBindingV1> scroll_bindings_;
+  gfx::Vector2dF layout_scroll_offset_;
+  gfx::Vector2dF visual_scroll_offset_;
+  gfx::Rect layout_visible_rect_;
+  gfx::Rect visual_visible_rect_;
+  float visual_scale_ = 0;
+  bool scroll_snapshot_valid_ = false;
+  uint64_t layout_generation_snapshot_ = 0;
   bool terminal_ = false;
   base::OneShotTimer timer_;
   base::WeakPtrFactory<SelectedSemanticRequestV1> weak_factory_{this};

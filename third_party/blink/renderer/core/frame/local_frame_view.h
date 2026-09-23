@@ -28,6 +28,7 @@
 
 #include <memory>
 #include <optional>
+#include <cstdint>
 
 #include "base/auto_reset.h"
 #include "base/dcheck_is_on.h"
@@ -213,6 +214,11 @@ class CORE_EXPORT LocalFrameView final
   bool WillDoPaintHoldingForFCP() const;
 
   unsigned LayoutCountForTesting() const { return layout_count_for_testing_; }
+  // A production freshness fence for semantic captures. Zero means the
+  // monotonic generation was exhausted; callers must fail closed.
+  uint64_t LayoutGenerationForSelectedSemantic() const {
+    return layout_generation_for_selected_semantic_;
+  }
   // Returns the number of block layout calls.
   //  * It's incremented when BlockNode::Layout() is called with NeedsLayout()
   //  * It can overflow. Do not use it in production.
@@ -1176,6 +1182,7 @@ class CORE_EXPORT LocalFrameView final
 
   bool layout_scheduling_enabled_;
   unsigned layout_count_for_testing_;
+  uint64_t layout_generation_for_selected_semantic_ = 1;
   uint32_t block_layout_count_for_testing_ = 0;
   HeapTaskRunnerTimer<LocalFrameView> update_plugins_timer_;
 

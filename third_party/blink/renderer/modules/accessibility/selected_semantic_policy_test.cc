@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "third_party/blink/renderer/modules/accessibility/selected_semantic_policy.h"
+#include "third_party/blink/public/web/web_selected_semantic_session.h"
 
 #include "third_party/blink/renderer/core/layout/layout_object_inlines.h"
 #include "third_party/blink/renderer/core/layout/layout_invalidation_reason.h"
@@ -23,6 +24,7 @@
 #include "third_party/blink/renderer/core/layout/inline/inline_item.h"
 #include "third_party/blink/renderer/core/layout/inline/inline_item_span.h"
 #include "third_party/blink/renderer/core/dom/element.h"
+#include "third_party/blink/renderer/core/css/css_style_sheet.h"
 #include "third_party/blink/renderer/core/dom/selected_semantic_read_scope.h"
 #include "third_party/blink/renderer/core/html_names.h"
 #include "third_party/blink/renderer/core/dom/node.h"
@@ -30,14 +32,18 @@
 #include "third_party/blink/renderer/core/frame/frame_test_helpers.h"
 #include "third_party/blink/renderer/core/frame/local_frame_view.h"
 #include "third_party/blink/renderer/core/html/html_body_element.h"
+#include "third_party/blink/renderer/core/html/html_style_element.h"
 #include "third_party/blink/renderer/core/frame/visual_viewport.h"
 #include "third_party/blink/renderer/core/layout/inline/inline_cursor.h"
 #include "third_party/blink/renderer/core/layout/inline/inline_node_data.h"
 #include "third_party/blink/renderer/core/layout/layout_block_flow.h"
 #include "third_party/blink/renderer/core/layout/layout_box.h"
+#include "third_party/blink/renderer/core/layout/layout_image.h"
+#include "third_party/blink/renderer/core/layout/layout_image_resource.h"
 #include "third_party/blink/renderer/core/layout/layout_text.h"
 #include "third_party/blink/renderer/core/layout/physical_box_fragment.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
+#include "third_party/blink/renderer/core/loader/resource/image_resource_content.h"
 #include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/paint/paint_layer_scrollable_area.h"
 #include "third_party/blink/renderer/core/testing/scoped_mock_overlay_scrollbars.h"
@@ -53,9 +59,11 @@
 #include "third_party/blink/renderer/platform/bindings/script_forbidden_scope.h"
 #include "third_party/blink/renderer/platform/bindings/exception_state.h"
 #include "third_party/blink/renderer/platform/heap/persistent.h"
+#include "third_party/blink/renderer/platform/heap/thread_state.h"
 #include "third_party/blink/renderer/platform/testing/task_environment.h"
 #include "third_party/blink/renderer/platform/testing/runtime_enabled_features_test_helpers.h"
 #include "third_party/blink/renderer/platform/wtf/functional.h"
+#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
 #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
 
 #include <array>
@@ -86,6 +94,8 @@
 #include "base/test/task_environment.h"
 #include "base/time/tick_clock.h"
 #include "third_party/blink/renderer/platform/wtf/wtf.h"
+#include "third_party/skia/include/core/SkImage.h"
+#include "third_party/skia/include/core/SkSurface.h"
 
 namespace blink {
 
@@ -2140,6 +2150,9 @@ class SelectedSemanticRequestTestPeer {
  public:
   static void Ready(SelectedSemanticRequestV1& request) { request.OnAXReady(); }
   static void Deadline(SelectedSemanticRequestV1& request) { request.OnDeadline(); }
+  static auto TakeButtonBindings(SelectedSemanticRequestV1& request) {
+    return request.TakeButtonBindings();
+  }
   static bool Pending(const SelectedSemanticRequestV1& request) {
     return !request.terminal_;
   }
@@ -2226,6 +2239,521 @@ class SelectedSemanticRequestTest : public RenderingTest {
   std::unique_ptr<AXContext> ax_context_;
 };
 
+void RecordWebCapture(std::vector<WebSelectedSemanticCaptureV1>* results,
+                      WebSelectedSemanticCaptureV1 result) {
+  results->push_back(std::move(result));
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionBindsOnlyLiveAdmittedButtons) {
+  SetReadyBody("<p>Visible</p>"
+               "<button id=first aria-label='Same'></button>"
+               "<button id=second aria-label='Same'></button>"
+               "<div aria-hidden=true><button aria-label='Canary'></button></div>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  EXPECT_TRUE(results.empty());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  const auto& result = results.front();
+  ASSERT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult, result.terminal);
+  ASSERT_EQ(WebSelectedSemanticDispositionV1::kAdmitted, result.disposition);
+  ASSERT_EQ(3u, result.entries.size());
+  EXPECT_EQ(WebSelectedSemanticRoleV1::kText, result.entries[0].role);
+  EXPECT_EQ(WebSelectedSemanticRoleV1::kButton, result.entries[1].role);
+  EXPECT_EQ(WebSelectedSemanticRoleV1::kButton, result.entries[2].role);
+  EXPECT_EQ(0u, result.entries[0].button_slot);
+  EXPECT_NE(0u, result.entries[1].button_slot);
+  EXPECT_NE(result.entries[1].button_slot, result.entries[2].button_slot);
+  EXPECT_TRUE(session.HasLiveButtonSlot(result.entries[1].button_slot));
+  EXPECT_TRUE(session.HasLiveButtonSlot(result.entries[2].button_slot));
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionNewCaptureRevokesQueuedSuccess) {
+  SetReadyBody("<button aria-label='First'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();  // First success is terminal, but still queued for delivery.
+  session.Capture(8, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(2u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult,
+            results[1].terminal);
+  ASSERT_EQ(1u, results[1].entries.size());
+  EXPECT_TRUE(session.HasLiveButtonSlot(results[1].entries[0].button_slot));
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionQueuedCancellationPreservesCaptureAudit) {
+  SetReadyBody("<button aria-label='Visible'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  ASSERT_TRUE(results.empty());
+  session.Cancel();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kCancelled, results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_EQ(0u, results[0].reserved_output_bytes);
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+  EXPECT_EQ(1u, results[0].audit.text_reads);
+  EXPECT_EQ(0u, results[0].audit.forbidden_reads);
+  EXPECT_EQ(7u, results[0].budget.utf8_bytes);
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionCancelRevokesQueuedAndDeliveredSlots) {
+  SetReadyBody("<button aria-label='First'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  session.Cancel();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kCancelled, results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  session.Capture(8, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(2u, results.size());
+  ASSERT_EQ(1u, results[1].entries.size());
+  const auto slot = results[1].entries[0].button_slot;
+  ASSERT_TRUE(session.HasLiveButtonSlot(slot));
+  session.Cancel();
+  EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionExpiryHasNoEntriesOrSlots) {
+  SetReadyBody("<button aria-label='First'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Milliseconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  task_environment().FastForwardBy(base::Milliseconds(1));
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kDeadlineExceeded,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+  DriveAX();
+  Deliver();
+  EXPECT_EQ(1u, results.size());
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionRemovedSourceCannotReuseSlot) {
+  SetReadyBody("<button id=first aria-label='First'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  ASSERT_EQ(1u, results[0].entries.size());
+  const auto slot = results[0].entries[0].button_slot;
+  ASSERT_TRUE(session.HasLiveButtonSlot(slot));
+  WeakPersistent<Node> removed(GetElementById("first"));
+  GetElementById("first")->remove();
+  DriveAX();
+  ThreadState::Current()->CollectAllGarbageForTesting();
+  EXPECT_EQ(nullptr, removed.Get());
+  EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionNeverTransmitsOwnZeroOrOffscreenCanaries) {
+  SetReadyBody(
+      "<p>Allowed positive</p>"
+      "<button aria-label='Zero canary' style='appearance:none;width:0;"
+      "height:20px;padding:0;border:0;overflow:visible'></button>"
+      "<button aria-label='Offscreen canary' style='position:relative;"
+      "left:900px;width:40px;height:20px'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  const auto& result = results.front();
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult, result.terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kAdmitted, result.disposition);
+  ASSERT_EQ(1u, result.entries.size());
+  EXPECT_EQ(WebSelectedSemanticRoleV1::kText, result.entries[0].role);
+  EXPECT_EQ("Allowed positive", result.entries[0].text);
+  EXPECT_EQ(0u, result.entries[0].button_slot);
+  EXPECT_EQ(1u, result.audit.text_reads);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionPostCaptureMutationSuppressesQueuedTextAndSlots) {
+  SetReadyBody("<button id=first aria-label='Original'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  GetElementById("first")->setAttribute(html_names::kAriaLabelAttr,
+                                         AtomicString("Changed"));
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionQueuedMutationPreservesCaptureAudit) {
+  SetReadyBody("<button id=target aria-label='Visible'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  ASSERT_TRUE(results.empty());
+  GetElementById("target")->setAttribute(html_names::kAriaLabelAttr,
+                                          AtomicString("Changed"));
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_EQ(0u, results[0].reserved_output_bytes);
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+  EXPECT_EQ(1u, results[0].audit.text_reads);
+  EXPECT_EQ(0u, results[0].audit.forbidden_reads);
+  EXPECT_EQ(7u, results[0].budget.utf8_bytes);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionStyleOnlyChangeSuppressesQueuedCapture) {
+  SetReadyBody("<style id=policy>button{display:block}</style>"
+               "<button aria-label='Visible'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  const uint64_t dom_version = GetDocument().DomTreeVersion();
+  DummyExceptionStateForTesting exception_state;
+  auto* style = To<HTMLStyleElement>(GetElementById("policy"));
+  ASSERT_NE(nullptr, style->sheet());
+  style->sheet()->insertRule("button{display:none}", 1, exception_state);
+  EXPECT_FALSE(exception_state.HadException());
+  EXPECT_EQ(dom_version, GetDocument().DomTreeVersion());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionNestedScrollChangeSuppressesQueuedCapture) {
+  SetReadyBody(
+      "<div id=scroller style='overflow:scroll;width:150px;height:40px'>"
+      "<button aria-label='Visible' style='display:block;position:relative;"
+      "top:100px;width:80px;height:20px'></button>"
+      "<div style='height:500px'></div></div>");
+  auto* box = To<LayoutBox>(GetElementById("scroller")->GetLayoutObject());
+  auto* area = box->GetScrollableArea();
+  ASSERT_NE(nullptr, area);
+  area->SetScrollOffset(ScrollOffset(0, 90),
+                        mojom::blink::ScrollType::kProgrammatic,
+                        cc::ScrollSourceType::kNone);
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  const uint64_t dom_version = GetDocument().DomTreeVersion();
+  const uint64_t style_version = GetDocument().StyleVersion();
+  area->SetScrollOffset(ScrollOffset(0, 0),
+                        mojom::blink::ScrollType::kProgrammatic,
+                        cc::ScrollSourceType::kNone);
+  ASSERT_EQ(ScrollOffset(0, 0), area->GetScrollOffset());
+  EXPECT_EQ(dom_version, GetDocument().DomTreeVersion());
+  EXPECT_EQ(style_version, GetDocument().StyleVersion());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionCacheLossSuppressesQueuedCapture) {
+  SetReadyBody("<button aria-label='Visible'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  ax_context_.reset();
+  ASSERT_EQ(nullptr, GetDocument().ExistingAXObjectCache());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionDeadlineAfterCaptureSuppressesQueuedSuccess) {
+  SetReadyBody("<button aria-label='Visible'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Milliseconds(10),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  task_environment().AdvanceClock(base::Milliseconds(10));
+  EXPECT_TRUE(results.empty());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kDeadlineExceeded,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionQueuedDeadlinePreservesCaptureAudit) {
+  SetReadyBody("<button aria-label='Visible'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Milliseconds(10),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  ASSERT_TRUE(results.empty());
+  task_environment().AdvanceClock(base::Milliseconds(10));
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kDeadlineExceeded,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_EQ(0u, results[0].reserved_output_bytes);
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+  EXPECT_EQ(1u, results[0].audit.text_reads);
+  EXPECT_EQ(0u, results[0].audit.forbidden_reads);
+  EXPECT_EQ(7u, results[0].budget.utf8_bytes);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionCompletedImageLayoutSuppressesQueuedCapture) {
+  SetReadyBody("<style>html,body{overflow:hidden}</style>"
+               "<img id=image style='display:block'>"
+               "<button id=target aria-label='Visible' style='display:block;"
+               "width:80px;height:20px'></button>");
+  auto* view = GetDocument().View();
+  ASSERT_NE(nullptr, view);
+  auto* layout_viewport = view->GetScrollableArea();
+  ASSERT_NE(nullptr, layout_viewport);
+  auto& visual_viewport = GetDocument().GetPage()->GetVisualViewport();
+  const auto layout_rect =
+      layout_viewport->VisibleContentRect(kExcludeScrollbars);
+  const auto visual_rect =
+      visual_viewport.VisibleContentRect(kExcludeScrollbars);
+  const auto layout_offset = layout_viewport->GetScrollOffset();
+  const auto visual_offset = visual_viewport.GetScrollOffset();
+  const int before_button_y =
+      GetElementById("target")->GetLayoutObject()->AbsoluteBoundingBoxRect().y();
+  EXPECT_LT(before_button_y, layout_rect.bottom());
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  EXPECT_TRUE(results.empty());
+  const uint64_t dom_version = GetDocument().DomTreeVersion();
+  const uint64_t style_version = GetDocument().StyleVersion();
+  auto* image_layout =
+      To<LayoutImage>(GetElementById("image")->GetLayoutObject());
+  ASSERT_NE(nullptr, image_layout);
+  sk_sp<SkSurface> surface =
+      SkSurfaces::Raster(SkImageInfo::MakeN32Premul(40, 900));
+  ASSERT_TRUE(surface);
+  sk_sp<SkImage> raster = surface->makeImageSnapshot();
+  auto* content = ImageResourceContent::CreateLoaded(
+      UnacceleratedStaticBitmapImage::Create(raster).get());
+  image_layout->ImageResource()->SetImageResource(content);
+  UpdateAllLifecyclePhasesForTest();
+  const int after_button_y =
+      GetElementById("target")->GetLayoutObject()->AbsoluteBoundingBoxRect().y();
+  EXPECT_GT(after_button_y, before_button_y);
+  EXPECT_GE(after_button_y, layout_rect.bottom());
+  EXPECT_EQ(dom_version, GetDocument().DomTreeVersion());
+  EXPECT_EQ(style_version, GetDocument().StyleVersion());
+  EXPECT_FALSE(view->NeedsLayout());
+  EXPECT_EQ(layout_rect,
+            layout_viewport->VisibleContentRect(kExcludeScrollbars));
+  EXPECT_EQ(visual_rect,
+            visual_viewport.VisibleContentRect(kExcludeScrollbars));
+  EXPECT_EQ(layout_offset, layout_viewport->GetScrollOffset());
+  EXPECT_EQ(visual_offset, visual_viewport.GetScrollOffset());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionCompletedImageLayoutRevokesDeliveredButtonSlot) {
+  SetReadyBody("<style>html,body{overflow:hidden}</style>"
+               "<img id=image style='display:block'>"
+               "<button aria-label='Visible' style='display:block;"
+               "width:80px;height:20px'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  ASSERT_EQ(1u, results[0].entries.size());
+  const uint64_t slot = results[0].entries[0].button_slot;
+  ASSERT_TRUE(session.HasLiveButtonSlot(slot));
+  sk_sp<SkSurface> surface =
+      SkSurfaces::Raster(SkImageInfo::MakeN32Premul(40, 900));
+  ASSERT_TRUE(surface);
+  auto* image_layout =
+      To<LayoutImage>(GetElementById("image")->GetLayoutObject());
+  ASSERT_NE(nullptr, image_layout);
+  image_layout->ImageResource()->SetImageResource(
+      ImageResourceContent::CreateLoaded(
+          UnacceleratedStaticBitmapImage::Create(
+              surface->makeImageSnapshot()).get()));
+  UpdateAllLifecyclePhasesForTest();
+  EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionPostDeliveryMutationRevokesExistingSlot) {
+  SetReadyBody("<button id=first aria-label='Original'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  ASSERT_EQ(1u, results[0].entries.size());
+  const auto slot = results[0].entries[0].button_slot;
+  ASSERT_TRUE(session.HasLiveButtonSlot(slot));
+  GetElementById("first")->setAttribute(html_names::kAriaLabelAttr,
+                                         AtomicString("Changed"));
+  EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionFailedCaptureHasNoPartialSlots) {
+  SetReadyBody("<button aria-label='First'></button>"
+               "<button id=bad></button>");
+  StringBuilder label;
+  label.Append("Bad prefix");
+  label.Append(UChar(0xd800));
+  GetElementById("bad")->setAttribute(html_names::kAriaLabelAttr,
+                                      label.ToAtomicString());
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kPolicyResult,
+            results[0].terminal);
+  EXPECT_EQ(WebSelectedSemanticDispositionV1::kUnsupportedText,
+            results[0].disposition);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_FALSE(session.HasLiveButtonSlot(1));
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionNullDocumentIsClosed) {
+  WebSelectedSemanticSession session(
+      WebDocument(), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  EXPECT_TRUE(results.empty());
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+}
+
+TEST_F(SelectedSemanticRequestTest, WebSessionMissingCacheIsClosedUnread) {
+  SetBodyInnerHTML("<p>Visible</p>");
+  ax_context_.reset();
+  ASSERT_EQ(nullptr, GetDocument().ExistingAXObjectCache());
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> results;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &results));
+  Deliver();
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ(WebSelectedSemanticTerminalV1::kStaleContext,
+            results[0].terminal);
+  EXPECT_TRUE(results[0].entries.empty());
+  EXPECT_EQ(0u, results[0].audit.text_reads);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionDestructionDropsPendingAndQueuedCompletion) {
+  for (bool queued : {false, true}) {
+    SCOPED_TRACE(queued);
+    SetReadyBody("<button aria-label='Visible'></button>");
+    auto session = std::make_unique<WebSelectedSemanticSession>(
+        WebDocument(&GetDocument()),
+        task_environment().GetMainThreadTaskRunner());
+    std::vector<WebSelectedSemanticCaptureV1> results;
+    session->Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                     base::BindOnce(&RecordWebCapture, &results));
+    if (queued)
+      DriveAX();
+    session.reset();
+    DriveAX();
+    Deliver();
+    EXPECT_TRUE(results.empty());
+  }
+}
+
 TEST_F(SelectedSemanticRequestTest, RealReadyCallbackPostsImmutableResultAfterFreeze) {
   SetReadyBody();
   auto results = std::make_shared<Results>();
@@ -2282,6 +2810,44 @@ TEST_F(SelectedSemanticRequestTest, WholeDocumentCancelClearsEntireResultOnce) {
   EXPECT_TRUE(results->front().node.text.empty());
   task_environment().FastForwardBy(base::Seconds(2));
   EXPECT_EQ(1u, results->size());
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WholeDocumentBindsOnlyAdmittedButtonsToExactWeakSources) {
+  SetReadyBody(
+      "<p>Visible text</p>"
+      "<button id=first aria-label='Same label'></button>"
+      "<button id=second aria-label='Same label'></button>"
+      "<div aria-hidden=true>"
+      "<button id=excluded aria-label='Excluded label'></button></div>");
+  Node* first = GetElementById("first");
+  Node* second = GetElementById("second");
+  ASSERT_TRUE(first && second);
+  auto results = std::make_shared<Results>();
+  auto request = RequestDocument(results);
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, results->size());
+  const auto& result = results->front();
+  ASSERT_EQ(SemanticRequestTerminalV1::kPolicyResult, result.terminal);
+  ASSERT_EQ(SemanticDispositionV1::kAdmitted,
+            result.observation.disposition);
+  ASSERT_EQ(3u, result.observation.entries.size());
+  EXPECT_EQ(SemanticObservationRoleV1::kText,
+            result.observation.entries[0].role);
+  EXPECT_EQ(SemanticObservationRoleV1::kButton,
+            result.observation.entries[1].role);
+  EXPECT_EQ(SemanticObservationRoleV1::kButton,
+            result.observation.entries[2].role);
+  EXPECT_EQ("Same label", result.observation.entries[1].text);
+  EXPECT_EQ("Same label", result.observation.entries[2].text);
+  EXPECT_EQ(0u, result.audit.forbidden_reads);
+  auto bindings = SelectedSemanticRequestTestPeer::TakeButtonBindings(*request);
+  ASSERT_EQ(2u, bindings.size());
+  EXPECT_EQ(1u, bindings[0].entry_index);
+  EXPECT_EQ(first, bindings[0].node.Get());
+  EXPECT_EQ(2u, bindings[1].entry_index);
+  EXPECT_EQ(second, bindings[1].node.Get());
 }
 
 TEST_F(SelectedSemanticRequestTest, WholeDocumentMissingReadyExpiresUnreadOnce) {
