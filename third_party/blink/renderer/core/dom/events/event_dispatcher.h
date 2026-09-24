@@ -29,6 +29,7 @@
 #define THIRD_PARTY_BLINK_RENDERER_CORE_DOM_EVENTS_EVENT_DISPATCHER_H_
 
 #include "base/dcheck_is_on.h"
+#include "base/functional/callback.h"
 #include "third_party/blink/renderer/core/dom/events/event_dispatch_result.h"
 #include "third_party/blink/renderer/core/dom/events/simulated_click_options.h"
 #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
@@ -59,6 +60,14 @@ class EventDispatcher {
   static void DispatchSimulatedClick(Node&,
                                      const Event* underlying_event,
                                      SimulatedClickCreationScope);
+  // Service-only guarded accessibility activation. Returns false when a guard
+  // check stops the remaining native sequence. Every exit unwinds transient
+  // active state and recursive-dispatch bookkeeping.
+  static bool DispatchSimulatedClickForSelectedSemantic(
+      Node&,
+      const Event* underlying_event,
+      SimulatedClickCreationScope,
+      const base::RepeatingCallback<bool()>& guard);
   static void DispatchSimulatedEnterEvent(HTMLInputElement& input_element);
 
   DispatchEventResult Dispatch();
@@ -67,6 +76,9 @@ class EventDispatcher {
 
  private:
   EventDispatcher(Node&, Event&);
+  EventDispatcher(Node&,
+                  Event&,
+                  const base::RepeatingCallback<bool()>& guard);
 
   // This is the Blink equivalent to the DOM Standard's
   // legacy-pre-activation behavior [1]. It is mostly the same, except it is
@@ -86,6 +98,8 @@ class EventDispatcher {
   Node* node_;
   Event* event_;
   LocalFrameView* view_;
+  base::RepeatingCallback<bool()> selected_semantic_guard_;
+  bool selected_semantic_stopped_ = false;
 #if DCHECK_IS_ON()
   bool event_dispatched_ = false;
 #endif

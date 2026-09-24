@@ -36,6 +36,7 @@
 
 #include "base/containers/span.h"
 #include "base/dcheck_is_on.h"
+#include "base/functional/callback.h"
 #include "base/gtest_prod_util.h"
 #include "base/memory/raw_ref.h"
 #include "base/memory/stack_allocated.h"
@@ -76,6 +77,12 @@ enum class ScrollSourceType;
 }
 
 namespace blink {
+
+enum class SelectedSemanticPressDispatchResult {
+  kNotStarted,
+  kStartedAndStopped,
+  kCompleted,
+};
 
 class AbstractInlineTextBox;
 class AXObject;
@@ -1504,6 +1511,10 @@ class MODULES_EXPORT AXObject : public GarbageCollected<AXObject> {
 
   // Modify or take an action on an object. Returns true if handled.
   bool PerformAction(const ui::AXActionData&);
+  // Guarded service-only button path. Unlike PerformAction(), this never
+  // updates lifecycle state or recursively substitutes a refreshed AXObject.
+  SelectedSemanticPressDispatchResult PerformSelectedSemanticButtonPress(
+      const base::RepeatingCallback<bool()>& guard);
   // TODO(accessibility) Do this through PerformAction() and move to private.
   bool RequestScrollToMakeVisibleWithSubFocusAction(
       const gfx::Rect&,

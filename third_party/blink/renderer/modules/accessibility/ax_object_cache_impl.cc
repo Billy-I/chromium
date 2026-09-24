@@ -3792,8 +3792,15 @@ void AXObjectCacheImpl::SerializeAXUpdatesIfNeeded(Document& document) {
   // Serialize the current tree changes unless not enough time has passed, or
   // another serialization is already in flight.
   if (IsSerializationInFlight()) {
-    // Another serialization is in flight. When it's finished, this method
-    // will be called again.
+    // A browser ack may still be outstanding, so do not start another send.
+    // Ready callbacks still need the frozen cache; capture already proved the
+    // tree, and a later press or verify is one of those callbacks.
+    ScopedFreezeAXCache scoped_freeze_cache(*this);
+    Vector<base::OnceClosure> callbacks;
+    ready_callbacks_.swap(callbacks);
+    for (auto& callback : callbacks) {
+      std::move(callback).Run();
+    }
     return;
   }
 

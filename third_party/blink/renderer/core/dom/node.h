@@ -31,6 +31,7 @@
 #include <concepts>
 
 #include "base/dcheck_is_on.h"
+#include "base/functional/callback.h"
 #include "base/notreached.h"
 #include "base/types/pass_key.h"
 #include "third_party/blink/public/mojom/devtools/console_message.mojom-blink.h"
@@ -1097,6 +1098,9 @@ class CORE_EXPORT Node : public EventTarget {
   void DispatchSimulatedClick(const Event* underlying_event,
                               SimulatedClickCreationScope =
                                   SimulatedClickCreationScope::kFromUserAgent);
+  bool DispatchSimulatedClickForSelectedSemantic(
+      const Event* underlying_event,
+      const base::RepeatingCallback<bool()>& guard);
 
   // Perform the default action for an event.
   virtual void DefaultEventHandler(Event&);

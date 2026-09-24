@@ -3413,6 +3413,22 @@ void Node::DispatchSimulatedClick(const Event* underlying_event,
   EventDispatcher::DispatchSimulatedClick(*this, underlying_event, scope);
 }
 
+bool Node::DispatchSimulatedClickForSelectedSemantic(
+    const Event* underlying_event,
+    const base::RepeatingCallback<bool()>& guard) {
+  if (!guard)
+    return false;
+  if (auto* element = IsElementNode() ? To<Element>(this) : parentElement()) {
+    element->ActivateDisplayLockIfNeeded(
+        DisplayLockActivationReason::kSimulatedClick);
+  }
+  if (!guard.Run())
+    return false;
+  return EventDispatcher::DispatchSimulatedClickForSelectedSemantic(
+      *this, underlying_event,
+      SimulatedClickCreationScope::kFromAccessibility, guard);
+}
+
 void Node::DefaultEventHandler(Event& event) {
   if (event.RawTarget() != this) {
     return;

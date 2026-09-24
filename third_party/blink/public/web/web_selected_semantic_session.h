@@ -44,6 +44,36 @@ enum class WebSelectedSemanticDispositionV1 {
 
 enum class WebSelectedSemanticRoleV1 { kText, kButton };
 
+enum class WebSelectedSemanticOperationStatusV1 {
+  kOk,
+  kInvalidRequest,
+  kStaleDocument,
+  kNotReady,
+  kPolicyExcluded,
+  kUnsupportedGeometry,
+  kLimitExceeded,
+  kCancelledBeforeActuation,
+  kEffectUncertain,
+};
+
+enum class WebSelectedSemanticActuationStateV1 {
+  kNotStarted,
+  kStarted,
+};
+
+struct WebSelectedSemanticPressV1 {
+  WebSelectedSemanticOperationStatusV1 status =
+      WebSelectedSemanticOperationStatusV1::kInvalidRequest;
+  WebSelectedSemanticActuationStateV1 actuation =
+      WebSelectedSemanticActuationStateV1::kNotStarted;
+};
+
+struct WebSelectedSemanticVerifyV1 {
+  WebSelectedSemanticOperationStatusV1 status =
+      WebSelectedSemanticOperationStatusV1::kInvalidRequest;
+  WebString value;
+};
+
 struct WebSelectedSemanticEntryV1 {
   WebSelectedSemanticRoleV1 role = WebSelectedSemanticRoleV1::kText;
   WebString text;
@@ -92,6 +122,9 @@ struct WebSelectedSemanticCaptureV1 {
 class BLINK_EXPORT WebSelectedSemanticSession final {
  public:
   using Completion = base::OnceCallback<void(WebSelectedSemanticCaptureV1)>;
+  using PressCompletion = base::OnceCallback<void(WebSelectedSemanticPressV1)>;
+  using VerifyCompletion =
+      base::OnceCallback<void(WebSelectedSemanticVerifyV1)>;
   WebSelectedSemanticSession(WebDocument,
                              scoped_refptr<base::SingleThreadTaskRunner>);
   ~WebSelectedSemanticSession();
@@ -100,6 +133,11 @@ class BLINK_EXPORT WebSelectedSemanticSession final {
       delete;
 
   void Capture(uint64_t epoch, base::TimeTicks deadline, Completion);
+  void Press(uint64_t button_slot,
+             uint64_t epoch,
+             base::TimeTicks deadline,
+             PressCompletion);
+  void Verify(uint64_t epoch, base::TimeTicks deadline, VerifyCompletion);
   void Cancel();
   // This is a liveness/ownership check, not action authorization. A future
   // action must re-run the full policy at its own clean checkpoint.

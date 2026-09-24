@@ -308,6 +308,14 @@ void HTMLButtonElement::AccessKeyAction(
   DispatchSimulatedClick(nullptr, creation_scope);
 }
 
+bool HTMLButtonElement::AccessKeyActionForSelectedSemantic(
+    const base::RepeatingCallback<bool()>& guard) {
+  Focus(FocusParams(FocusTrigger::kUserGesture));
+  if (!guard.Run())
+    return false;
+  return DispatchSimulatedClickForSelectedSemantic(nullptr, guard);
+}
+
 bool HTMLButtonElement::IsURLAttribute(const Attribute& attribute) const {
   return attribute.GetName() == html_names::kFormactionAttr ||
          HTMLFormControlElement::IsURLAttribute(attribute);

@@ -2249,6 +2249,10 @@ void RecordWebCapture(std::vector<WebSelectedSemanticCaptureV1>* results,
                       WebSelectedSemanticCaptureV1 result) {
   results->push_back(std::move(result));
 }
+void RecordWebPress(std::vector<WebSelectedSemanticPressV1>* results,
+                    WebSelectedSemanticPressV1 result);
+void RecordWebVerify(std::vector<WebSelectedSemanticVerifyV1>* results,
+                     WebSelectedSemanticVerifyV1 result);
 
 TEST_F(SelectedSemanticRequestTest, WebSessionBindsOnlyLiveAdmittedButtons) {
   SetReadyBody("<p>Visible</p>"
@@ -2972,10 +2976,11 @@ class SelectedSemanticActionPrototypeTest : public SimTest {
     LoadURL(kURL);
     GetPage().SetFocused(true);
     StringBuilder html;
-    html.Append("<!doctype html><html><body><form id=form><button id=target type='");
+    html.Append("<!doctype html><html><body><form id=form></form>"
+                "<button id=target form=form type='");
     html.Append(button_type);
-    html.Append("' aria-label='Press'></button></form>"
-                "<p id=status>pending</p><p id=clicks>0</p>"
+    html.Append("' aria-label='Press'></button>"
+                "<p id=action-status>pending</p><p id=clicks>0</p>"
                 "<p id=pointerdowns>0</p><p id=submits>0</p><script>"
                 "const button=document.getElementById('target');"
                 "const bump=id=>{const text=document.getElementById(id).firstChild;"
@@ -3003,29 +3008,84 @@ class SelectedSemanticActionPrototypeTest : public SimTest {
   bool PressNativeDefault() {
     auto* cache =
         To<AXObjectCacheImpl>(GetDocument().ExistingAXObjectCache());
-    if (!cache || !Button())
+    Element* button = Button();
+    if (!cache || !button || !button->GetLayoutObject())
       return false;
-    AXObject* object = cache->Get(Button());
+    AXObject* object = cache->Get(button);
     if (!object)
       return false;
-    ui::AXActionData action;
-    action.action = ax::mojom::blink::Action::kDoDefault;
-    return object->PerformAction(action);
+    Node* const parent = button->parentNode();
+    const DocumentToken document_token = GetDocument().Token();
+    const gfx::Rect bounds =
+        button->GetLayoutObject()->AbsoluteBoundingBoxRect();
+    auto guard = base::BindRepeating(
+        [](WeakPersistent<Element> button, WeakPersistent<Node> parent,
+           WeakPersistent<Document> document, DocumentToken document_token,
+           gfx::Rect bounds) {
+          Element* current = button.Get();
+          return current && document &&
+                 document->Token() == document_token &&
+                 current->isConnected() &&
+                 &current->GetDocument() == document.Get() &&
+                 current->parentNode() == parent.Get() &&
+                 current->FastGetAttribute(html_names::kAriaLabelAttr) ==
+                     "Press" &&
+                 current->GetLayoutObject() &&
+                 current->GetLayoutObject()->AbsoluteBoundingBoxRect() ==
+                     bounds;
+        },
+        WrapWeakPersistent(button), WrapWeakPersistent(parent),
+        WrapWeakPersistent(&GetDocument()), document_token, bounds);
+    return object->PerformSelectedSemanticButtonPress(guard) !=
+           SelectedSemanticPressDispatchResult::kNotStarted;
   }
   void RestoreTargetAndStatus() {
     Button()->setAttribute(html_names::kAriaLabelAttr, AtomicString("Press"));
-    To<Text>(ById("status")->firstChild())->setData("pending");
+    To<Text>(ById("action-status")->firstChild())->setData("pending");
+  }
+  void DriveAXAndDeliver() {
+    auto* cache =
+        To<AXObjectCacheImpl>(GetDocument().ExistingAXObjectCache());
+    ASSERT_NE(nullptr, cache);
+    cache->MarkDocumentDirty();
+    cache->UpdateAXForAllDocuments();
+    task_environment().RunUntilIdle();
+  }
+  uint64_t CaptureActionSession(
+      WebSelectedSemanticSession& session,
+      std::vector<WebSelectedSemanticCaptureV1>& results,
+      uint64_t epoch = 7) {
+    session.Capture(epoch, base::TimeTicks::Now() + base::Seconds(1),
+                    base::BindOnce(&RecordWebCapture, &results));
+    DriveAXAndDeliver();
+    if (results.empty())
+      return 0;
+    for (const auto& entry : results.back().entries) {
+      if (entry.role == WebSelectedSemanticRoleV1::kButton)
+        return entry.button_slot;
+    }
+    return 0;
   }
 
   std::unique_ptr<AXContext> ax_context_;
 };
 
+void RecordWebPress(std::vector<WebSelectedSemanticPressV1>* results,
+                    WebSelectedSemanticPressV1 result) {
+  results->push_back(std::move(result));
+}
+
+void RecordWebVerify(std::vector<WebSelectedSemanticVerifyV1>* results,
+                     WebSelectedSemanticVerifyV1 result) {
+  results->push_back(std::move(result));
+}
+
 TEST_F(SelectedSemanticActionPrototypeTest, NativeButtonPositiveChangesStatus) {
   LoadPrototype("button", "button.addEventListener('click',()=>{bump('clicks');"
-                          "document.getElementById('status').firstChild.data='complete'});");
+                          "document.getElementById('action-status').firstChild.data='complete'});");
   EXPECT_TRUE(PressNativeDefault());
   EXPECT_EQ("1", TextAt("clicks"));
-  EXPECT_EQ("complete", TextAt("status"));
+  EXPECT_EQ("complete", TextAt("action-status"));
   EXPECT_FALSE(Button()->IsActive());
 }
 
@@ -3033,7 +3093,20 @@ TEST_F(SelectedSemanticActionPrototypeTest, NativeButtonNoopLeavesStatusPending)
   LoadPrototype("button", "button.addEventListener('click',()=>bump('clicks'));");
   EXPECT_TRUE(PressNativeDefault());
   EXPECT_EQ("1", TextAt("clicks"));
-  EXPECT_EQ("pending", TextAt("status"));
+  EXPECT_EQ("pending", TextAt("action-status"));
+  EXPECT_FALSE(Button()->IsActive());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       GuardedClickSharesRecursiveDispatchSetAndCleansUp) {
+  LoadPrototype("button", "button.addEventListener('click',()=>{"
+                          "bump('clicks');button.click()});");
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_FALSE(Button()->IsActive());
+
+  EXPECT_TRUE(PressNativeDefault());
+  EXPECT_EQ("2", TextAt("clicks"));
   EXPECT_FALSE(Button()->IsActive());
 }
 
@@ -3042,16 +3115,16 @@ TEST_F(SelectedSemanticActionPrototypeTest,
   LoadPrototype("button", "button.addEventListener('focus',()=>{"
                           "button.setAttribute('aria-label','Changed')},{once:true});"
                           "button.addEventListener('click',()=>{bump('clicks');"
-                          "document.getElementById('status').firstChild.data='complete'});");
+                          "document.getElementById('action-status').firstChild.data='complete'});");
   EXPECT_TRUE(PressNativeDefault());
   EXPECT_EQ("Changed", Button()->FastGetAttribute(html_names::kAriaLabelAttr));
   EXPECT_EQ("0", TextAt("clicks"));
-  EXPECT_EQ("pending", TextAt("status"));
+  EXPECT_EQ("pending", TextAt("action-status"));
   EXPECT_FALSE(Button()->IsActive());
   RestoreTargetAndStatus();
   EXPECT_TRUE(PressNativeDefault());
   EXPECT_EQ("1", TextAt("clicks"));
-  EXPECT_EQ("complete", TextAt("status"));
+  EXPECT_EQ("complete", TextAt("action-status"));
   EXPECT_FALSE(Button()->IsActive());
 }
 
@@ -3061,17 +3134,17 @@ TEST_F(SelectedSemanticActionPrototypeTest,
                           "bump('pointerdowns');button.setAttribute('aria-label',"
                           "'Changed')},{once:true});"
                           "button.addEventListener('click',()=>{bump('clicks');"
-                          "document.getElementById('status').firstChild.data='complete'});");
+                          "document.getElementById('action-status').firstChild.data='complete'});");
   EXPECT_TRUE(PressNativeDefault());
   EXPECT_EQ("1", TextAt("pointerdowns"));
   EXPECT_EQ("Changed", Button()->FastGetAttribute(html_names::kAriaLabelAttr));
   EXPECT_EQ("0", TextAt("clicks"));
-  EXPECT_EQ("pending", TextAt("status"));
+  EXPECT_EQ("pending", TextAt("action-status"));
   EXPECT_FALSE(Button()->IsActive());
   RestoreTargetAndStatus();
   EXPECT_TRUE(PressNativeDefault());
   EXPECT_EQ("1", TextAt("clicks"));
-  EXPECT_EQ("complete", TextAt("status"));
+  EXPECT_EQ("complete", TextAt("action-status"));
   EXPECT_FALSE(Button()->IsActive());
 }
 
@@ -3091,6 +3164,127 @@ TEST_F(SelectedSemanticActionPrototypeTest,
   EXPECT_EQ("2", TextAt("clicks"));
   EXPECT_EQ("1", TextAt("submits"));
   EXPECT_FALSE(Button()->IsActive());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       WebSessionPressIsOneUseAndVerifiesExactBoundText) {
+  LoadPrototype("button", "button.addEventListener('click',()=>{bump('clicks');"
+                          "document.getElementById('action-status').firstChild.data='complete'});");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> captures;
+  const uint64_t slot = CaptureActionSession(session, captures);
+  ASSERT_NE(0u, slot);
+
+  std::vector<WebSelectedSemanticPressV1> presses;
+  session.Press(slot, 7, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  DriveAXAndDeliver();
+  ASSERT_EQ(1u, presses.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kEffectUncertain,
+            presses[0].status);
+  EXPECT_EQ(WebSelectedSemanticActuationStateV1::kStarted,
+            presses[0].actuation);
+  EXPECT_EQ("1", TextAt("clicks"));
+  EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+
+  session.Press(slot, 8, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(2u, presses.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kStaleDocument,
+            presses[1].status);
+  EXPECT_EQ(WebSelectedSemanticActuationStateV1::kNotStarted,
+            presses[1].actuation);
+  EXPECT_EQ("1", TextAt("clicks"));
+
+  std::vector<WebSelectedSemanticVerifyV1> verifies;
+  session.Verify(9, base::TimeTicks::Now() + base::Seconds(1),
+                 base::BindOnce(&RecordWebVerify, &verifies));
+  DriveAXAndDeliver();
+  ASSERT_EQ(1u, verifies.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kOk, verifies[0].status);
+  EXPECT_EQ("complete", verifies[0].value);
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       WebSessionVerifyRejectsReplacementStatusText) {
+  LoadPrototype("button", "button.addEventListener('click',()=>{"
+                          "document.getElementById('action-status').firstChild.data='complete'});");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> captures;
+  const uint64_t slot = CaptureActionSession(session, captures);
+  ASSERT_NE(0u, slot);
+  std::vector<WebSelectedSemanticPressV1> presses;
+  session.Press(slot, 7, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  DriveAXAndDeliver();
+  ASSERT_EQ(1u, presses.size());
+
+  Element* status = ById("action-status");
+  status->firstChild()->remove();
+  status->AppendChild(Text::Create(GetDocument(), "complete"));
+  GetDocument().UpdateStyleAndLayout(DocumentUpdateReason::kTest);
+  std::vector<WebSelectedSemanticVerifyV1> verifies;
+  session.Verify(8, base::TimeTicks::Now() + base::Seconds(1),
+                 base::BindOnce(&RecordWebVerify, &verifies));
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, verifies.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kStaleDocument,
+            verifies[0].status);
+  EXPECT_TRUE(verifies[0].value.IsEmpty());
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       WebSessionBindsFixedStatusInsteadOfSearchingPendingText) {
+  LoadPrototype(
+      "button",
+      "const unrelated=document.createElement('p');"
+      "unrelated.textContent='pending';document.body.appendChild(unrelated);"
+      "button.addEventListener('click',()=>{"
+      "document.getElementById('action-status').firstChild.data='complete'});");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> captures;
+  const uint64_t slot = CaptureActionSession(session, captures);
+  ASSERT_NE(0u, slot);
+
+  std::vector<WebSelectedSemanticPressV1> presses;
+  session.Press(slot, 7, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  DriveAXAndDeliver();
+  ASSERT_EQ(1u, presses.size());
+
+  std::vector<WebSelectedSemanticVerifyV1> verifies;
+  session.Verify(8, base::TimeTicks::Now() + base::Seconds(1),
+                 base::BindOnce(&RecordWebVerify, &verifies));
+  DriveAXAndDeliver();
+  ASSERT_EQ(1u, verifies.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kOk, verifies[0].status);
+  EXPECT_EQ("complete", verifies[0].value);
+}
+
+TEST_F(SelectedSemanticActionPrototypeTest,
+       WebSessionQueuedCancelProvesNotStarted) {
+  LoadPrototype("button", "button.addEventListener('click',()=>bump('clicks'));");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> captures;
+  const uint64_t slot = CaptureActionSession(session, captures);
+  ASSERT_NE(0u, slot);
+  std::vector<WebSelectedSemanticPressV1> presses;
+  session.Press(slot, 7, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  session.Cancel();
+  task_environment().RunUntilIdle();
+  ASSERT_EQ(1u, presses.size());
+  EXPECT_EQ(
+      WebSelectedSemanticOperationStatusV1::kCancelledBeforeActuation,
+      presses[0].status);
+  EXPECT_EQ(WebSelectedSemanticActuationStateV1::kNotStarted,
+            presses[0].actuation);
+  EXPECT_EQ("0", TextAt("clicks"));
 }
 
 // Temporary Task4b diagnostic. Observe only; a production action guard cannot
@@ -3115,7 +3309,10 @@ class SelectedSemanticGeometryProbe final : public NativeEventListener {
   SelectedSemanticGeometryProbe(Element& button,
                                 Element& form,
                                 SelectedSemanticGeometryProbeSnapshot& snapshot)
-      : button_(&button), form_(&form), snapshot_(&snapshot) {}
+      : button_(&button),
+        form_(&form),
+        parent_(button.parentElement()),
+        snapshot_(&snapshot) {}
 
   void Invoke(ExecutionContext*, Event*) override {
     Document& document = button_->GetDocument();
@@ -3123,7 +3320,7 @@ class SelectedSemanticGeometryProbe final : public NativeEventListener {
         To<AXObjectCacheImpl>(document.ExistingAXObjectCache());
     snapshot_->saw = true;
     snapshot_->target_connected = button_->isConnected();
-    snapshot_->target_parent_same = button_->parentElement() == form_;
+    snapshot_->target_parent_same = button_->parentElement() == parent_;
     snapshot_->label_same =
         button_->FastGetAttribute(html_names::kAriaLabelAttr) == "Press";
     snapshot_->target_needs_layout =
@@ -3149,12 +3346,14 @@ class SelectedSemanticGeometryProbe final : public NativeEventListener {
   void Trace(Visitor* visitor) const override {
     visitor->Trace(button_);
     visitor->Trace(form_);
+    visitor->Trace(parent_);
     NativeEventListener::Trace(visitor);
   }
 
  private:
   Member<Element> button_;
   Member<Element> form_;
+  Member<Element> parent_;
   SelectedSemanticGeometryProbeSnapshot* snapshot_;
 };
 
@@ -3163,7 +3362,7 @@ class SelectedSemanticActionGeometryProbeTest
  protected:
   void RunProbe(bool status_before, bool fixed_slot, bool multiline) {
     StringBuilder handlers;
-    handlers.Append("const status=document.getElementById('status');"
+    handlers.Append("const status=document.getElementById('action-status');"
                     "status.style.cssText='display:block;margin:0;width:150px;"
                     "font-size:16px;line-height:20px;white-space:pre-line;");
     if (fixed_slot) {
@@ -3180,7 +3379,7 @@ class SelectedSemanticActionGeometryProbeTest
     handlers.Append("'});");
     LoadPrototype("button", handlers.ToString().Utf8().c_str());
 
-    Element* status = ById("status");
+    Element* status = ById("action-status");
     Element* form = ById("form");
     ASSERT_NE(nullptr, status);
     ASSERT_NE(nullptr, form);
@@ -3515,6 +3714,59 @@ TEST_F(SelectedSemanticRequestTest,
   GetElementById("first")->setAttribute(html_names::kAriaLabelAttr,
                                          AtomicString("Changed"));
   EXPECT_FALSE(session.HasLiveButtonSlot(slot));
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionChangedLabelCannotStartPress) {
+  SetReadyBody("<button id=target aria-label='Original'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> captures;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &captures));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, captures.size());
+  ASSERT_EQ(1u, captures[0].entries.size());
+  const uint64_t slot = captures[0].entries[0].button_slot;
+  GetElementById("target")->setAttribute(html_names::kAriaLabelAttr,
+                                          AtomicString("Changed"));
+  std::vector<WebSelectedSemanticPressV1> presses;
+  session.Press(slot, 8, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  Deliver();
+  ASSERT_EQ(1u, presses.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kStaleDocument,
+            presses[0].status);
+  EXPECT_EQ(WebSelectedSemanticActuationStateV1::kNotStarted,
+            presses[0].actuation);
+}
+
+TEST_F(SelectedSemanticRequestTest,
+       WebSessionChangedGeometryCannotStartPress) {
+  SetReadyBody("<button id=target aria-label='Original' "
+               "style='width:100px;height:30px'></button>");
+  WebSelectedSemanticSession session(
+      WebDocument(&GetDocument()), task_environment().GetMainThreadTaskRunner());
+  std::vector<WebSelectedSemanticCaptureV1> captures;
+  session.Capture(7, base::TimeTicks::Now() + base::Seconds(1),
+                  base::BindOnce(&RecordWebCapture, &captures));
+  DriveAX();
+  Deliver();
+  ASSERT_EQ(1u, captures.size());
+  const uint64_t slot = captures[0].entries[0].button_slot;
+  GetElementById("target")->setAttribute(
+      html_names::kStyleAttr, AtomicString("width:120px;height:30px"));
+  GetDocument().UpdateStyleAndLayout(DocumentUpdateReason::kTest);
+  std::vector<WebSelectedSemanticPressV1> presses;
+  session.Press(slot, 8, base::TimeTicks::Now() + base::Seconds(1),
+                base::BindOnce(&RecordWebPress, &presses));
+  Deliver();
+  ASSERT_EQ(1u, presses.size());
+  EXPECT_EQ(WebSelectedSemanticOperationStatusV1::kStaleDocument,
+            presses[0].status);
+  EXPECT_EQ(WebSelectedSemanticActuationStateV1::kNotStarted,
+            presses[0].actuation);
 }
 
 TEST_F(SelectedSemanticRequestTest, WebSessionFailedCaptureHasNoPartialSlots) {

@@ -7723,6 +7723,57 @@ void AXObject::UpdateStyleAndLayoutTreeForNode(Node& node) {
 // Modify or take an action on an object.
 //
 
+SelectedSemanticPressDispatchResult
+AXObject::PerformSelectedSemanticButtonPress(
+    const base::RepeatingCallback<bool()>& guard) {
+  Document* document = GetDocument();
+  auto* button = DynamicTo<HTMLButtonElement>(GetNode());
+  if (!guard || !document || IsDetached() || !button ||
+      !button->isConnected() || &button->GetDocument() != document ||
+      !guard.Run()) {
+    return SelectedSemanticPressDispatchResult::kNotStarted;
+  }
+
+  // IsFocusable(kNoneForAccessibility) DCHECKs on dirty style. A prior click
+  // can leave style dirty without changing the guarded facts. Refresh before
+  // any side effect, then re-check so a style update cannot skip the guard.
+  if (button->NeedsStyleRecalc() ||
+      document->NeedsLayoutTreeUpdateForNodeIncludingDisplayLocked(*button)) {
+    document->UpdateStyleAndLayoutTreeForElement(
+        button, DocumentUpdateReason::kAccessibility);
+    if (IsDetached() || !button->isConnected() ||
+        &button->GetDocument() != document || !guard.Run()) {
+      return SelectedSemanticPressDispatchResult::kNotStarted;
+    }
+  }
+
+  // The caller consumes its one-use operation token in the successful initial
+  // guard immediately before this first side effect.
+  LocalFrame::NotifyUserActivation(
+      document->GetFrame(),
+      mojom::blink::UserActivationNotificationType::kInteraction);
+  if (!guard.Run())
+    return SelectedSemanticPressDispatchResult::kStartedAndStopped;
+
+  document->SetSequentialFocusNavigationStartingPoint(button);
+  if (button->IsFocusable(Element::UpdateBehavior::kNoneForAccessibility) &&
+      !button->IsFocusedElementInDocument()) {
+    Page* const page = document->GetPage();
+    if (!page)
+      return SelectedSemanticPressDispatchResult::kStartedAndStopped;
+    page->GetFocusController().SetFocusedElement(
+        button, document->GetFrame(),
+        FocusParams(SelectionBehaviorOnFocus::kNone,
+                    mojom::blink::FocusType::kMouse, nullptr));
+    if (!guard.Run())
+      return SelectedSemanticPressDispatchResult::kStartedAndStopped;
+  }
+
+  return button->AccessKeyActionForSelectedSemantic(guard)
+             ? SelectedSemanticPressDispatchResult::kCompleted
+             : SelectedSemanticPressDispatchResult::kStartedAndStopped;
+}
+
 bool AXObject::PerformAction(const ui::AXActionData& action_data) {
   Document* document = GetDocument();
   if (!document) {

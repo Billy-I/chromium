@@ -976,9 +976,11 @@ Disposition CheckIncludedParent(const AXObject& child,
 
 SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
     Document& document, AXObjectCacheImpl& cache, SemanticBudgetV1& budget,
-    SemanticAuditV1& audit, Vector<SemanticButtonBindingV1>& button_bindings) {
+    SemanticAuditV1& audit, Vector<SemanticButtonBindingV1>& button_bindings,
+    Vector<SemanticTextBindingV1>& text_bindings) {
   SemanticObservationV1 observation;
   button_bindings.clear();
+  text_bindings.clear();
   SelectedSemanticReadScope scope(document);
   const auto before = scope.ReadCounts();
   SemanticIdentityLedger identities;
@@ -1065,6 +1067,11 @@ SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
           button_bindings.push_back(
               SemanticButtonBindingV1{observation.entries.size(),
                                       WeakPersistent<Node>(const_cast<Node*>(source))});
+        } else {
+          text_bindings.push_back(
+              SemanticTextBindingV1{observation.entries.size(),
+                                    WeakPersistent<Node>(
+                                        const_cast<Node*>(source))});
         }
         observation.entries.push_back(SemanticObservationEntryV1{source->IsTextNode()
             ? SemanticObservationRoleV1::kText
@@ -1106,6 +1113,7 @@ SemanticObservationV1 CaptureSelectedSemanticDocumentV1(
   if (result != Disposition::kAdmitted) {
     observation = {};
     button_bindings.clear();
+    text_bindings.clear();
     observation.disposition = result;
   } else {
     observation.disposition = Disposition::kAdmitted;
@@ -1243,7 +1251,8 @@ void SelectedSemanticRequestV1::OnAXReady() {
               ? document_->View()->LayoutGenerationForSelectedSemantic()
               : 0;
       result.observation = CaptureSelectedSemanticDocumentV1(
-          *document_, *cache_, result.budget, result.audit, button_bindings_);
+          *document_, *cache_, result.budget, result.audit, button_bindings_,
+          text_bindings_);
       if (result.observation.disposition == SemanticDispositionV1::kAdmitted &&
           document_->DomTreeVersion() == before_tree_version &&
           document_->StyleVersion() == before_style_version &&
@@ -1265,6 +1274,7 @@ void SelectedSemanticRequestV1::OnAXReady() {
                   ? SemanticDispositionV1::kStaleDocument
                   : snapshot;
           button_bindings_.clear();
+          text_bindings_.clear();
         }
       } else if (result.observation.disposition ==
                  SemanticDispositionV1::kAdmitted) {
@@ -1315,6 +1325,7 @@ void SelectedSemanticRequestV1::Finish(SemanticRequestResultV1 result) {
     result.node = {};
     result.observation = {};
     button_bindings_.clear();
+    text_bindings_.clear();
     result.document_tree_version = 0;
     result.document_style_version = 0;
     result.document_layout_generation = 0;
@@ -1325,6 +1336,7 @@ void SelectedSemanticRequestV1::Finish(SemanticRequestResultV1 result) {
     result.node = {};
     if (result.observation.disposition != SemanticDispositionV1::kAdmitted) {
       button_bindings_.clear();
+      text_bindings_.clear();
       result.document_tree_version = 0;
       result.document_style_version = 0;
       result.document_layout_generation = 0;
@@ -1349,6 +1361,12 @@ SelectedSemanticRequestV1::TakeButtonBindings() {
   CHECK(IsMainThread() && task_runner_->RunsTasksInCurrentSequence());
   CHECK(terminal_ && kind_ == SemanticRequestKindV1::kDocument);
   return std::move(button_bindings_);
+}
+
+Vector<SemanticTextBindingV1> SelectedSemanticRequestV1::TakeTextBindings() {
+  CHECK(IsMainThread() && task_runner_->RunsTasksInCurrentSequence());
+  CHECK(terminal_ && kind_ == SemanticRequestKindV1::kDocument);
+  return std::move(text_bindings_);
 }
 
 SemanticDispositionV1 SelectedSemanticRequestV1::CaptureScrollSnapshot(

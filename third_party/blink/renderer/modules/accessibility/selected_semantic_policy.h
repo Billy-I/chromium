@@ -98,6 +98,10 @@ struct SemanticButtonBindingV1 {
   unsigned entry_index;
   WeakPersistent<Node> node;
 };
+struct SemanticTextBindingV1 {
+  unsigned entry_index;
+  WeakPersistent<Node> node;
+};
 struct SemanticScrollBindingV1 {
   WeakPersistent<PaintLayerScrollableArea> area;
   gfx::Vector2dF offset;
@@ -140,6 +144,7 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   // Renderer-main-sequence sidecar consumed only after posted result delivery.
   // The owner must retain this request until that delivery runs.
   Vector<SemanticButtonBindingV1> TakeButtonBindings();
+  Vector<SemanticTextBindingV1> TakeTextBindings();
   // Compares the exact main-frame view and every registered scrollable area
   // against the clean capture checkpoint. Compositor-only motion remains a
   // separate browser completion obligation.
@@ -172,6 +177,7 @@ class MODULES_EXPORT SelectedSemanticRequestV1 final {
   scoped_refptr<base::SingleThreadTaskRunner> task_runner_;
   Completion completion_;
   Vector<SemanticButtonBindingV1> button_bindings_;
+  Vector<SemanticTextBindingV1> text_bindings_;
   WeakPersistent<LocalFrameView> scroll_view_;
   Vector<SemanticScrollBindingV1> scroll_bindings_;
   gfx::Vector2dF layout_scroll_offset_;

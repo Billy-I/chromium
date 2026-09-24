@@ -26,6 +26,7 @@
 
 #include <utility>
 
+#include "base/functional/callback.h"
 #include "third_party/blink/renderer/bindings/core/v8/script_iterator.h"
 #include "third_party/blink/renderer/core/dom/events/simulated_click_options.h"
 #include "third_party/blink/renderer/core/html/forms/html_form_control_element.h"
@@ -58,6 +59,11 @@ class CORE_EXPORT HTMLButtonElement final : public HTMLFormControlElement {
 
   bool CanBeCommandInvoker() const override;
   bool IsValidInterestInvoker(Element& target) const override;
+
+  // Narrow service-only continuation used by guarded selected-semantic
+  // accessibility activation. This does not expose input synthesis.
+  bool AccessKeyActionForSelectedSemantic(
+      const base::RepeatingCallback<bool()>& guard);
 
  protected:
   bool SupportsBaseAppearanceInternal(

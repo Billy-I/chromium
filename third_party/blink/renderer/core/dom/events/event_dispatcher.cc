@@ -69,6 +69,16 @@
 #include "ui/events/keycodes/dom/keycode_converter.h"
 namespace blink {
 
+namespace {
+
+GCedHeapHashSet<Member<Node>>& NodesDispatchingSimulatedClicks() {
+  DEFINE_STATIC_LOCAL(Persistent<GCedHeapHashSet<Member<Node>>>, nodes,
+                      (MakeGarbageCollected<GCedHeapHashSet<Member<Node>>>()));
+  return *nodes;
+}
+
+}  // namespace
+
 DispatchEventResult EventDispatcher::DispatchEvent(Node& node, Event& event) {
   TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("blink.debug"),
                "EventDispatcher::dispatchEvent");
@@ -81,6 +91,15 @@ DispatchEventResult EventDispatcher::DispatchEvent(Node& node, Event& event) {
 
 EventDispatcher::EventDispatcher(Node& node, Event& event)
     : node_(&node), event_(&event) {
+  view_ = node.GetDocument().View();
+  event_->InitEventPath(*node_);
+}
+
+EventDispatcher::EventDispatcher(
+    Node& node,
+    Event& event,
+    const base::RepeatingCallback<bool()>& guard)
+    : node_(&node), event_(&event), selected_semantic_guard_(guard) {
   view_ = node.GetDocument().View();
   event_->InitEventPath(*node_);
 }
@@ -100,17 +119,16 @@ void EventDispatcher::DispatchSimulatedClick(
   // before dispatchSimulatedClick() returns. This vector is here just to
   // prevent the code from running into an infinite recursion of
   // dispatchSimulatedClick().
-  DEFINE_STATIC_LOCAL(Persistent<GCedHeapHashSet<Member<Node>>>,
-                      nodes_dispatching_simulated_clicks,
-                      (MakeGarbageCollected<GCedHeapHashSet<Member<Node>>>()));
+  auto& nodes_dispatching_simulated_clicks =
+      NodesDispatchingSimulatedClicks();
 
   if (IsDisabledFormControl(&node))
     return;
 
-  if (nodes_dispatching_simulated_clicks->Contains(&node))
+  if (nodes_dispatching_simulated_clicks.Contains(&node))
     return;
 
-  nodes_dispatching_simulated_clicks->insert(&node);
+  nodes_dispatching_simulated_clicks.insert(&node);
 
   Element* element = DynamicTo<Element>(node);
   bool prevent_mouse_events = false;
@@ -153,7 +171,75 @@ void EventDispatcher::DispatchSimulatedClick(
                                              underlying_event, creation_scope))
       .Dispatch();
 
-  nodes_dispatching_simulated_clicks->erase(&node);
+  nodes_dispatching_simulated_clicks.erase(&node);
+}
+
+bool EventDispatcher::DispatchSimulatedClickForSelectedSemantic(
+    Node& node,
+    const Event* underlying_event,
+    SimulatedClickCreationScope creation_scope,
+    const base::RepeatingCallback<bool()>& guard) {
+  auto& nodes_dispatching_simulated_clicks =
+      NodesDispatchingSimulatedClicks();
+
+  if (!guard || IsDisabledFormControl(&node) ||
+      nodes_dispatching_simulated_clicks.Contains(&node)) {
+    return false;
+  }
+
+  nodes_dispatching_simulated_clicks.insert(&node);
+  Element* element = DynamicTo<Element>(node);
+  auto cleanup = [&]() {
+    if (element)
+      element->SetActive(false);
+    nodes_dispatching_simulated_clicks.erase(&node);
+  };
+  auto dispatch_then_check = [&](const AtomicString& type) {
+    EventDispatcher(node, *SimulatedEventUtil::CreateEvent(
+                              type, node, underlying_event, creation_scope))
+        .Dispatch();
+    return guard.Run();
+  };
+
+  DispatchEventResult pointerdown_result =
+      EventDispatcher(node, *SimulatedEventUtil::CreateEvent(
+                                event_type_names::kPointerdown, node,
+                                underlying_event, creation_scope))
+          .Dispatch();
+  bool prevent_mouse_events =
+      pointerdown_result == DispatchEventResult::kCanceledByEventHandler;
+  if (!guard.Run()) {
+    cleanup();
+    return false;
+  }
+  if (!prevent_mouse_events &&
+      !dispatch_then_check(event_type_names::kMousedown)) {
+    cleanup();
+    return false;
+  }
+  if (element)
+    element->SetActive(true);
+  if (!guard.Run() || !dispatch_then_check(event_type_names::kPointerup) ||
+      (!prevent_mouse_events &&
+       !dispatch_then_check(event_type_names::kMouseup))) {
+    cleanup();
+    return false;
+  }
+  if (element)
+    element->SetActive(false);
+  if (!guard.Run()) {
+    cleanup();
+    return false;
+  }
+
+  EventDispatcher click_dispatcher(
+      node, *SimulatedEventUtil::CreateEvent(event_type_names::kClick, node,
+                                             underlying_event, creation_scope),
+      guard);
+  click_dispatcher.Dispatch();
+  const bool completed = !click_dispatcher.selected_semantic_stopped_;
+  cleanup();
+  return completed;
 }
 
 void EventDispatcher::DispatchSimulatedEnterEvent(
@@ -265,6 +351,13 @@ DispatchEventResult EventDispatcher::Dispatch() {
     if (DispatchEventAtCapturing() == kContinueDispatching) {
       DispatchEventAtBubbling();
     }
+  }
+  if (selected_semantic_guard_ && !selected_semantic_guard_.Run()) {
+    // Listener side effects already happened. Suppress every remaining native
+    // activation/default-action stage while still running dispatch cleanup.
+    selected_semantic_stopped_ = true;
+    activation_target = nullptr;
+    event_->preventDefault();
   }
   DispatchEventPostProcess(activation_target,
                            pre_dispatch_event_handler_result);
